@@ -98,9 +98,7 @@ class VanillaBNN(StatefulBase):
         self.n_inputs = net_params['n_inputs']
         self.n_hidden = net_params['n_hidden']
         self.n_outputs = net_params['n_outputs']
-
-        self.snn_beta = net_params['snn_beta']
-
+        
         self.loss_fn = F.cross_entropy # Reductions is mean by default
         self.acc_fn = xe_classifier_accuracy
         
@@ -112,6 +110,9 @@ class VanillaBNN(StatefulBase):
         self.W_inp = nn.Linear(self.n_inputs, self.n_hidden)
         self.W_rec = nn.Linear(self.n_hidden, self.n_hidden)
         self.W_ro = nn.Linear(self.n_hidden, self.n_outputs)
+        self.W_inp.weight.data *= 10
+        self.W_rec.weight.data *= 10
+
         self.z1 = torch.zeros(())
         
         self.use_snn = net_params.get('use_snn', False)
@@ -123,8 +124,6 @@ class VanillaBNN(StatefulBase):
             self.hidden_neurons = HH(self.n_hidden, device)
 
         self.reset_state()
-        
-        self.filter_len = net_params['filter_length']
         self.trunc = net_params.get('trunc', -1) # Truncation for TBTT.
 
     def reset_state(self, batchSize=1):
@@ -158,7 +157,7 @@ class VanillaBNN(StatefulBase):
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()
 
-        self.z1[:, t, :] = mem_hidden
+        self.z1[:, t, :] = spk_hidden
         
         z2 = self.W_ro(spk_hidden)
         spk_output = F.softmax(z2, dim = -1) # No output neurons!
@@ -186,8 +185,8 @@ class VanillaBNN(StatefulBase):
 
         # Record the final layer
         out_size = torch.Size([batch[1].shape[0], T, self.n_outputs]) # [B, T, Ny]
-        spk_out = torch.empty(out_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device) # This has to be a float, otherwise causes gradient problems
-
+        spk_out = torch.empty(out_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0 # This has to be a float, otherwise causes gradient problems
+        
         hidden_size = torch.Size([batch[1].shape[0], T, self.n_hidden]) # [B, T, Nh]
         self.z1 = torch.empty(hidden_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)
         if debug:
@@ -204,7 +203,7 @@ class VanillaBNN(StatefulBase):
             
             grad_cap = batch[0].shape[1] - self.trunc
             with torch.set_grad_enabled(bidx >= grad_cap):
-                spk_out[:, time_idx, :], *db_step = self(x, time_idx, debug=debug)
+                spk_out[:, time_idx, :] = self(x, time_idx, debug=debug)
                 
 #             if debug:
 #                 db['spk_hidden'][:, time_idx, :] = db_step[0]['spk_hidden']
@@ -215,7 +214,7 @@ class VanillaBNN(StatefulBase):
             plt.subplot(2,1,1)
             plt.plot(self.z1[0, :, :].detach().cpu())
             plt.subplot(2,1,2)
-            plt.plot(spk_out[0, :, :].detach().cpu())
+            plt.plot(spk_out[0, 1:, :].detach().cpu())
             plt.show()
 
         filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)

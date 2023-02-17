@@ -12,6 +12,8 @@ import int_data as syn
 from networks import VanillaBNN
 from utils import fit, eval_on_test_set, sliding_window_states, PCA_dim, plot_pca, plot_accuracy, c_vals
 from matplotlib import pyplot as plt
+import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
 toy_params = {
     'data_type': 'retro_context_int', # int, context, retro_context, context_int, retro_context_int, retro_context_anti, cont_int, 
@@ -254,7 +256,9 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
             plt.yticks([])
         plt.show()
       
+    net_params['filter_length'] = 50
     net_params['cuda'] = True
+    net_params['use_snn'] = False
     net = VanillaBNN(net_params, device='cuda').to('cuda')
     init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
     
@@ -265,7 +269,7 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
         net = net.to('cuda')
         print(net.hh_hidden.gna)
     else:
-        net = fit(net, 'TEST', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask)    
+        net = fit(net, 'BNN_SCALE_10', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False)    
     
     testData, testOutputMask, _ = syn.generate_data(
             test_set_size, toy_params, net_params['n_outputs'], 
@@ -277,7 +281,7 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
     print('Accuracy: ', accuracy.item())
     spk_hidden = db['spk_hidden'].detach().cpu().numpy()
     spk_out = db['spk_out'].detach().cpu().numpy()
-    spk_out= spk_out[:, 10:, :]
+    spk_out = spk_out[:, 10:, :]
     
     def svd_analysis():
         W_ro = net.W_ro.weight.data.detach().cpu().numpy()
