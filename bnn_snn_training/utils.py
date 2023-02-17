@@ -8,18 +8,24 @@ Created on Tue Jan 17 18:13:11 2023
 import numpy as np 
 import torch
 from matplotlib import pyplot as plt
+import os
 
 # 0 Red, 1 blue, 2 green, 3 purple, 4 orange, 5 teal, 6 gray, 7 pink, 8 yellow
 c_vals = ['#e53e3e', '#3182ce', '#38a169', '#805ad5','#dd6b20', '#319795', '#718096', '#d53f8c', '#d69e2e',]
 c_vals_l = ['#feb2b2', '#90cdf4', '#9ae6b4', '#d6bcfa', '#fbd38d', '#81e6d9', '#e2e8f0', '#fbb6ce', '#faf089',]
 c_vals_d = ['#9b2c2c', '#2c5282', '#276749', '#553c9a', '#9c4221', '#285e61', '#2d3748', '#97266d', '#975a16',]
 
-
-def fit(net, toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask):
-    delay_str = "Delay" if toy_params["n_delay"] > 0 else "No_Delay"
-    regulate_str = 'regulated' if net.regulate else 'unregulated'
+def fit(net, folder_name, toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask):    
+    if not os.path.isdir('SAVES'):
+        os.mkdir('SAVES')
+        
+    folder = 'SAVES/' + folder_name
+    if os.path.isdir(folder):
+        raise Exception(f'Error in fit: folder {folder} already exists. Please delete it. Overriding existing folder is disabled for safety.')
     
-    # Save toy_params to file. THIS IS IMPORTANT since the words are random binary vectors. If we run again without same seed
+    os.mkdir(folder) # Make folder to store everything for run.
+    
+    # Save parameters to file. THIS IS IMPORTANT since the words are random binary vectors. If we run again without same seed
     # will have different random binary vectors!
     import json
     class NumpyEncoder(json.JSONEncoder):
@@ -27,10 +33,11 @@ def fit(net, toy_params, net_params, train_params, trainData, validData, trainOu
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
             return json.JSONEncoder.default(self, obj)
-    
-    json = json.dumps(toy_params, cls=NumpyEncoder)
-    with open(f'SAVES/RANDOM_START_NOISY_SHORT_40_toy_params_{delay_str}_{regulate_str}.json', 'w') as f:
-        f.write(json)
+        
+    for params, name in zip([toy_params, net_params, train_params], ['toy_params', 'net_params', 'train_params']):
+        param_txt = json.dumps(params, cls=NumpyEncoder)
+        with open(f'{folder}/{name}.json', 'w') as f:
+            f.write(param_txt)
         
     net.verbose = True
     _ = net.fit('sequence', epochs=train_params['epochs'], 
@@ -39,7 +46,7 @@ def fit(net, toy_params, net_params, train_params, trainData, validData, trainOu
                 gradientClip=train_params['gradient_clip'],
                 monitorFreq=train_params['monitorFreq'], 
                 trainOutputMask=trainOutputMask, validOutputMask=validOutputMask, 
-                filename = f'SAVES/RANDOM_START_NOISY_SHORT_40_save_{delay_str}_{regulate_str}')
+                filename = f'{folder}/save')
     return net
 
 def plot_accuracy(net):

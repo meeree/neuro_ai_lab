@@ -7,65 +7,17 @@ Created on Tue Jan 17 17:52:34 2023
 
 # imports
 import snntorch as snn
-from snntorch import spikeplot as splt
-from snntorch import spikegen
 from snntorch import surrogate
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-
 import matplotlib.pyplot as plt
 import numpy as np
-import itertools
-
-from sklearn.decomposition import PCA
 
 import torch.nn.functional as F
 import sys
-sys.path.append('mpn')
-from net_utils import StatefulBase, check_dims, random_weight_init, binary_classifier_accuracy, xe_classifier_accuracy
-from gradient_methods import SmoothGrad
-
-SAMPLES = 100
-STDDEV = 0.1
-
-class WeightSampler(torch.jit.ScriptModule):
-    '''Class supporting adding S offsets to weight matrix'''
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.W = nn.Linear(output_dim, input_dim, bias=False).weight # note transpose
-        self.W = nn.Parameter(self.W)
-        self.noise = torch.zeros(())
-        self.W_noisy = torch.zeros(())
-        self.set_params(1, 0.0)
-        
-    def set_params(self, S, stddev):
-        self.S = S
-        self.stddev = stddev
-    
-    def noisify(self):
-        # Copies of weight for noisy sampling over batches and S samples.
-        self.W_noisy = self.W
-        self.W_noisy = self.W_noisy.unsqueeze(0) # Batch size dimension. Need for batch multiplication.
-        self.W_noisy = self.W_noisy.unsqueeze(0).repeat(self.S, 1, 1, 1) # Samples.
-
-        self.noise = torch.normal(0.0, self.stddev * torch.ones_like(self.W_noisy))
-        self.noise[0, :, :, :] = 0.0 # No noise added to first sample. This is needed for gradient calculation!
-        self.W_noisy += self.noise
-
-    @torch.jit.script_method 
-    def forward(self, x):
-        # Reshape dims to extract sample dim and batch dim.
-        dims = (self.S, -1, 1, x.shape[1])
-        z = torch.matmul(x.view(dims), self.W_noisy)
-        return z.reshape((x.shape[0], -1))
-
-PATH_TO_BNN = '../../../Desktop/LossLandscapesBNN/src' # Replace with your own path.
-sys.path.append(PATH_TO_BNN)
-from config import CFG
-CFG.dt = 0.1
+sys.path.append('mpn') 
+from net_utils import StatefulBase, xe_classifier_accuracy
 
 class HH(torch.jit.ScriptModule):
     def __init__(self, L, device):
@@ -140,7 +92,7 @@ class HH(torch.jit.ScriptModule):
     
 class VanillaBNN(StatefulBase):
     ''' Implements a network of biological (or spiking) neurons with a specified neuron model type. '''
-    def __init__(self, net_params, use_snn = False, device = 'cpu'):
+    def __init__(self, net_params, device = 'cpu'):
         super(VanillaBNN,self).__init__()
 
         self.n_inputs = net_params['n_inputs']
@@ -154,7 +106,7 @@ class VanillaBNN(StatefulBase):
         
         # Uses a given filter to convolve the the spike counts over time. 
         # This is a retrospective padding, so will have edge effects at start 
-        self.filter_len = int(round(50 / CFG.dt))
+        self.filter_len = net_params['filter_length']
 
         # Initialize layers
         self.W_inp = nn.Linear(self.n_inputs, self.n_hidden)
@@ -162,7 +114,7 @@ class VanillaBNN(StatefulBase):
         self.W_ro = nn.Linear(self.n_hidden, self.n_outputs)
         self.z1 = torch.zeros(())
         
-        self.use_snn = net_params['use_snn']
+        self.use_snn = net_params.get('use_snn', False)
         if self.use_snn:
             # Surrogate gradients
             spike_grad = surrogate.fast_sigmoid(slope=25)
@@ -266,7 +218,7 @@ class VanillaBNN(StatefulBase):
             plt.plot(spk_out[0, :, :].detach().cpu())
             plt.show()
 
-        filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(self.device)
+        filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)
         spk_out_conv = torch.transpose(spk_out, 1, 2) # B, T, Ny -> B, Ny, T (for convolve along dim=2)
         spk_out_conv = spk_out_conv.reshape(-1, spk_out_conv.shape[-1]).unsqueeze(1) # B, Ny, T -> B*Ny, 1, T
 

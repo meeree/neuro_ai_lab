@@ -255,13 +255,9 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
         plt.show()
       
     net_params['cuda'] = True
-    net = VanillaBNN(net_params, regulate=False, device='cuda').to('cuda')
-    net.filter_len = net_params['filter_length']
+    net = VanillaBNN(net_params, device='cuda').to('cuda')
     init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
-    print(net.hh_hidden.gna)
     
-  #  net.hh_hidden.gk = 0.0 # TURN OFF POTASSIUM CHANNEL
-    # plot(net)
     if len(fl) > 0:
         sd = torch.load(fl)
         sd.pop('hist')
@@ -269,8 +265,7 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
         net = net.to('cuda')
         print(net.hh_hidden.gna)
     else:
-        net = fit(net, toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask)    
-    # plot(net)
+        net = fit(net, 'TEST', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask)    
     
     testData, testOutputMask, _ = syn.generate_data(
             test_set_size, toy_params, net_params['n_outputs'], 
