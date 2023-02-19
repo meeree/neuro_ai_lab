@@ -123,6 +123,7 @@ class VanillaBNN(StatefulBase):
         self.reset_state()
         self.trunc = net_params.get('trunc', -1) # Truncation for TBTT.
         self.n_per_step = net_params.get('n_per_step', 1) # For how many timesteps should the same batch input be fed in?
+        self.random_start = net_params.get('random_start', 0) # Random start data so we can be robust to sequence length.
 
     def reset_state(self, batchSize=1):
         if self.use_snn:
@@ -135,8 +136,10 @@ class VanillaBNN(StatefulBase):
             
         self.spk_hidden = torch.zeros((batchSize, self.W_rec.weight.data.shape[-1],), 
                                       device=self.W_rec.weight.data.device) #shape=[B,Nh]
+        
+        self.timers = torch.zeros_like(self.spk_hidden)
 
-    def forward(self, x, t, debug=False):
+    def forward(self, x, t):
         """
         Runs a single forward pass of the network 
         (iterated over in self.evaluate() for sequential data)
@@ -151,6 +154,8 @@ class VanillaBNN(StatefulBase):
         # Pass input through hidden neurons.
         if self.use_snn:
             spk_hidden, mem_hidden = self.hidden_neurons(z1 + 0.5, self.mem_hidden)
+            self.timers = torch.where(spk_hidden > 0.1, 20, self.timers - 1)
+            spk_hidden = (self.timers > 0).float()
         else:
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()
@@ -163,15 +168,7 @@ class VanillaBNN(StatefulBase):
         # Saves all internal states
         self.spk_hidden = spk_hidden
         self.mem_hidden = mem_hidden
-
-        if debug:
-            db_step = {
-                'spk_hidden': spk_hidden,
-                'mem_hidden': mem_hidden,
-            }
-            return spk_output, db_step
-        else:
-            return spk_output
+        return spk_output
 
     def evaluate(self, batch, debug=False): 
         if self.trunc < 0:
@@ -186,21 +183,15 @@ class VanillaBNN(StatefulBase):
         
         hidden_size = torch.Size([batch[1].shape[0], T, self.n_hidden]) # [B, T, Nh]
         self.z1 = torch.empty(hidden_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0
-        if debug:
-            hidden_size = torch.Size([batch[1].shape[0], batch[1].shape[1], self.n_hidden]) # [B, T, Nh]
-            db = {
-                'spk_hidden': torch.empty(hidden_size, dtype=torch.float, device=batch[1].device),
-                'mem_hidden': torch.empty(hidden_size, dtype=torch.float, device=batch[1].device),
-            }
 
-        random_start = np.random.randint(0, T // 10) # This makes us have variable length inputs!
+        random_start = 0 if self.random_start <= 0 else np.random.randint(0, self.random_start) 
         for time_idx in range(random_start, T):
             bidx = time_idx // self.n_per_step
             x = batch[0][:, bidx, :] # [B, Nx]
             
             grad_cap = batch[0].shape[1] - self.trunc
             with torch.set_grad_enabled(bidx >= grad_cap):
-                spk_out[:, time_idx, :] = self(x, time_idx, debug=debug)
+                spk_out[:, time_idx, :] = self(x, time_idx)
                                 
         self.counter = self.__dict__.get("counter", -1) + 1
         if self.counter % 5 == 0:
@@ -219,7 +210,7 @@ class VanillaBNN(StatefulBase):
         spk_out_cum = spk_out_cum[:, -batch[1].shape[1]:, :] # Make output compatible with mask. Really only care about final timestep value. 
 
         if debug:
-            db['spk_out'] = spk_out
+            db = {'spk_hidden': self.z1, 'spk_out': spk_out}
             return db
         else:
             return spk_out_cum

@@ -13,6 +13,7 @@ from networks import VanillaBNN
 from utils import fit, eval_on_test_set, sliding_window_states, PCA_dim, plot_pca, plot_accuracy, c_vals
 from matplotlib import pyplot as plt
 import os
+from tqdm import tqdm
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
 toy_params = {
@@ -236,19 +237,29 @@ def hh_properties_test():
 # hh_properties_test()
 # exit()
 
-def get_fit_lif(I0, freq, fudge = 0.99):
+def get_fit_lif(I0, freq, fudge = 0.99, debug = False):
     ''' Fit LIF model so that it fires at a given frequency given a fixed input current I0. '''
     from snntorch import Leaky
     beta = (1 - fudge) ** freq
-    thresh = I0 / (1 - beta)
+    thresh = fudge * I0 / (1 - beta)
     lif = Leaky(beta, threshold = thresh)
+    
+    if debug:
+        mems = torch.zeros(2000)
+        for i in range(1,2000):
+            _, mems[i] = lif(torch.ones(1)*I0, mems[i-1])
+        plt.plot(mems.detach())
+        plt.show()
+    
     return lif
 
+# get_fit_lif(0.1, 0.006, 0.99, True)
+# exit()
 
-def fit_lif_hh_fi_curve(T=1000):
+def fit_lif_hh_fi_curve(T=5000):
     ''' Fit an LIF neuron to an HH neuron using F-I curves. '''
     from networks import HH
-    S = 100 # Number of samples for F-I curve (batch size).
+    S = 500 # Number of samples for F-I curve (batch size).
     I = torch.linspace(0, 2, S) # Applied currents.
     hh = HH(1, 'cpu')
     hh.reset_state(S, randomize=False)
@@ -258,7 +269,7 @@ def fit_lif_hh_fi_curve(T=1000):
         Ts_hh[:, i] = hh(I.unsqueeze(-1)).squeeze()
 
     def get_fi_curve(Ts):
-        spikes = torch.logical_and(Ts[:, 1:] > 0.1, Ts[:, :-1] <= 0.1)
+        spikes = torch.logical_and(Ts[:, 1:] > 0.1, Ts[:, :-1] <= 0.1).float()
         return torch.mean(spikes, 1) * (1000 / hh.dt)
         
     fi_hh = get_fi_curve(Ts_hh)
@@ -266,12 +277,13 @@ def fit_lif_hh_fi_curve(T=1000):
     # Fit LIF to HH fi-curve.
     max_I0 = torch.max(I)
     max_freq = torch.max(fi_hh)
-    max_freq /= T # Convert from Hz to timesteps.
+    max_freq /= (1000 / hh.dt) # Convert from Hz to timesteps.
+    print(max_freq, 1/max_freq)
     
     # Try out a bunch of fudge values and use one that gives least L2 error.
-    fudges = torch.linspace(0.01, 0.2)
-    best_err, best_Ts, best_lif, errs = 1e10, None, None, []
-    for fudge in fudges:
+    fudges = np.linspace(0.05, 0.1, 20)
+    best_err, best_Ts, best_fudge, errs = 1e10, None, None, []
+    for fudge in tqdm(fudges):
         lif = get_fit_lif(max_I0, max_freq, fudge)
         mem = lif.init_leaky()
         Ts_lif = Ts_hh.clone()
@@ -281,28 +293,36 @@ def fit_lif_hh_fi_curve(T=1000):
         fi_lif = get_fi_curve(Ts_lif)
         err = torch.mean((fi_hh - fi_lif)**2).item()
         if err < best_err:
-            best_err, best_Ts, best_lif = err, Ts_lif, lif
+            best_err, best_Ts, best_fudge = err, Ts_lif, fudge
         errs.append(err)
     
     plt.figure()
-    plt.plot(fudge, errs)
+    plt.plot(fudges, errs)
+    plt.xscale('log')
+    plt.xlabel('Fudge (%)')
+    plt.ylabel('FI-Curve Error (L2)')
     plt.show()
     
     best_fi_lif = get_fi_curve(best_Ts)
     plt.figure()
     plt.plot(I, best_fi_lif)
     plt.plot(I, fi_hh)
+    plt.legend(['LIF', 'HH'])
+    plt.title('Fit FI-Curves')
+    plt.xlabel('Input')
+    plt.ylabel('Firing Frequency (Hz)')
     plt.show()
     
     plt.figure()
-    plt.imshow(Ts_hh - best_Ts, aspect='auto', cmap='seismic', vmin=-1, vmax=1)
+    plt.imshow(Ts_hh.detach() - best_Ts.detach(), aspect='auto', cmap='seismic', vmin=-1, vmax=1, interpolation = 'sinc')
     cbar = plt.colorbar(ticks=[-1, 0, 1])
     cbar.ax.set_yticklabels(['LIF', 'None', 'HH'])
     plt.show()
 
-    return best_lif
+    return max_I0, max_freq, best_fudge
     
-
+# print(fit_lif_hh_fi_curve(5000))
+# exit()
 
 def analyze_network_discrete(fl = '', toy_params_fl = ''):
     global toy_params
@@ -325,7 +345,8 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
       
     net_params['filter_length'] = 50
     net_params['cuda'] = True
-    net_params['use_snn'] = False
+    net_params['use_snn'] = True
+    net_params['n_per_step'] = 40
     net = VanillaBNN(net_params, device='cuda').to('cuda')
     init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
     
@@ -334,9 +355,12 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
         sd.pop('hist')
         net.load_state_dict(sd)
         net = net.to('cuda')
-        print(net.hh_hidden.gna)
     else:
         net = fit(net, 'BNN_SCALE_10', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False)    
+
+    # Swap out LIF model instead of HH.
+    # net.use_snn = True
+    net.hidden_neurons = get_fit_lif(2.0, 0.0038, 0.05) # Use parameters to fit LIF to HH
     
     testData, testOutputMask, _ = syn.generate_data(
             test_set_size, toy_params, net_params['n_outputs'], 
@@ -483,4 +507,4 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
 analyze_network_discrete()    
 # analyze_network_discrete('SAVES/TRAIN_GNA_NOISY_SHORT_40_save_No_Delay_unregulated_3001.pt', 'SAVES/TRAIN_GNA_NOISY_SHORT_40_toy_params_No_Delay_unregulated.json')
 # analyze_network_discrete('SAVES/REGULARIZED_NOISY_SHORT_40_save_No_Delay_unregulated_2524.pt', 'SAVES/REGULARIZED_NOISY_SHORT_40_toy_params_No_Delay_unregulated.json')
-analyze_network_discrete('SAVES/NOISY_SHORT_40_save_No_Delay_unregulated_2830.pt', 'SAVES/NOISY_SHORT_40_toy_params_No_Delay_unregulated.json')
+analyze_network_discrete('../../integrators/SAVES/NOISY_SHORT_40_save_No_Delay_unregulated_2830.pt', '../../integrators/SAVES/NOISY_SHORT_40_toy_params_No_Delay_unregulated.json')
