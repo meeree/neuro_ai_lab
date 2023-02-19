@@ -43,7 +43,7 @@ def fit(net, folder_name, toy_params, net_params, train_params, trainData, valid
     net.verbose = True
     _ = net.fit('sequence', epochs=train_params['epochs'], 
                 trainData=trainData, batchSize=train_params['batch_size'],
-                validBatch=validData[:,:,:], learningRate=1e-3,
+                validBatch=validData[:,:,:], learningRate=train_params['lr'],
                 gradientClip=train_params['gradient_clip'],
                 monitorFreq=train_params['monitorFreq'], 
                 trainOutputMask=trainOutputMask, validOutputMask=validOutputMask, 

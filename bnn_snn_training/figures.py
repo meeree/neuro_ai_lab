@@ -236,7 +236,74 @@ def hh_properties_test():
 # hh_properties_test()
 # exit()
 
+def get_fit_lif(I0, freq, fudge = 0.99):
+    ''' Fit LIF model so that it fires at a given frequency given a fixed input current I0. '''
+    from snntorch import Leaky
+    beta = (1 - fudge) ** freq
+    thresh = I0 / (1 - beta)
+    lif = Leaky(beta, threshold = thresh)
+    return lif
+
+
+def fit_lif_hh_fi_curve(T=1000):
+    ''' Fit an LIF neuron to an HH neuron using F-I curves. '''
+    from networks import HH
+    S = 100 # Number of samples for F-I curve (batch size).
+    I = torch.linspace(0, 2, S) # Applied currents.
+    hh = HH(1, 'cpu')
+    hh.reset_state(S, randomize=False)
+    hh.Iapp = 0.0
+    Ts_hh = torch.zeros((S, T))
+    for i in range(T):
+        Ts_hh[:, i] = hh(I.unsqueeze(-1)).squeeze()
+
+    def get_fi_curve(Ts):
+        spikes = torch.logical_and(Ts[:, 1:] > 0.1, Ts[:, :-1] <= 0.1)
+        return torch.mean(spikes, 1) * (1000 / hh.dt)
+        
+    fi_hh = get_fi_curve(Ts_hh)
     
+    # Fit LIF to HH fi-curve.
+    max_I0 = torch.max(I)
+    max_freq = torch.max(fi_hh)
+    max_freq /= T # Convert from Hz to timesteps.
+    
+    # Try out a bunch of fudge values and use one that gives least L2 error.
+    fudges = torch.linspace(0.01, 0.2)
+    best_err, best_Ts, best_lif, errs = 1e10, None, None, []
+    for fudge in fudges:
+        lif = get_fit_lif(max_I0, max_freq, fudge)
+        mem = lif.init_leaky()
+        Ts_lif = Ts_hh.clone()
+        for i in range(T):
+            Ts_lif[:, i], mem = lif(I, mem)
+            
+        fi_lif = get_fi_curve(Ts_lif)
+        err = torch.mean((fi_hh - fi_lif)**2).item()
+        if err < best_err:
+            best_err, best_Ts, best_lif = err, Ts_lif, lif
+        errs.append(err)
+    
+    plt.figure()
+    plt.plot(fudge, errs)
+    plt.show()
+    
+    best_fi_lif = get_fi_curve(best_Ts)
+    plt.figure()
+    plt.plot(I, best_fi_lif)
+    plt.plot(I, fi_hh)
+    plt.show()
+    
+    plt.figure()
+    plt.imshow(Ts_hh - best_Ts, aspect='auto', cmap='seismic', vmin=-1, vmax=1)
+    cbar = plt.colorbar(ticks=[-1, 0, 1])
+    cbar.ax.set_yticklabels(['LIF', 'None', 'HH'])
+    plt.show()
+
+    return best_lif
+    
+
+
 def analyze_network_discrete(fl = '', toy_params_fl = ''):
     global toy_params
     import json

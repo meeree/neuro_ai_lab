@@ -41,9 +41,10 @@ class HH(torch.jit.ScriptModule):
         self.divs = torch.tensor([-9.0, -9.0, -12.0, 9.0, 9.0, 12.0]).view(-1, 1, 1).to(self.device)
         self.muls = torch.tensor([0.182, 0.02, 0.0, -0.124, -0.002, 0.0]).view(-1, 1, 1).to(self.device)
         
-    def reset_state(self, B):
+    def reset_state(self, B, randomize=True):
         self.V = torch.ones((B, self.L)).to(self.device) * -65.0
-        self.V += torch.normal(torch.zeros_like(self.V), 5.0) # Add some noise to initial conditions.
+        if randomize:
+            self.V += torch.normal(torch.zeros_like(self.V), 5.0) # Add some noise to initial conditions.
         self.T = torch.zeros_like(self.V).to(self.device)
                 
         # Gating variables
@@ -57,7 +58,6 @@ class HH(torch.jit.ScriptModule):
         
         aK = torch.zeros((3, B, self.L)).to(self.device)
         bK = torch.zeros((3, B, self.L)).to(self.device)
-        
         # Optimization: concatenate all gating variables in one big tensor since their updates are very similar.
         m = self.K[0, :, :]
         n = self.K[1, :, :]
@@ -110,9 +110,6 @@ class VanillaBNN(StatefulBase):
         self.W_inp = nn.Linear(self.n_inputs, self.n_hidden)
         self.W_rec = nn.Linear(self.n_hidden, self.n_hidden)
         self.W_ro = nn.Linear(self.n_hidden, self.n_outputs)
-        self.W_inp.weight.data *= 10
-        self.W_rec.weight.data *= 10
-
         self.z1 = torch.zeros(())
         
         self.use_snn = net_params.get('use_snn', False)
@@ -125,6 +122,7 @@ class VanillaBNN(StatefulBase):
 
         self.reset_state()
         self.trunc = net_params.get('trunc', -1) # Truncation for TBTT.
+        self.n_per_step = net_params.get('n_per_step', 1) # For how many timesteps should the same batch input be fed in?
 
     def reset_state(self, batchSize=1):
         if self.use_snn:
@@ -152,7 +150,7 @@ class VanillaBNN(StatefulBase):
         
         # Pass input through hidden neurons.
         if self.use_snn:
-            spk_hidden, mem_hidden = self.hidden_neurons(z1, self.mem_hidden)
+            spk_hidden, mem_hidden = self.hidden_neurons(z1 + 0.5, self.mem_hidden)
         else:
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()
@@ -179,8 +177,7 @@ class VanillaBNN(StatefulBase):
         if self.trunc < 0:
             self.trunc = batch[1].shape[1]
             
-        n_per_step = 40 # For how many timesteps should the same batch input be fed in?
-        T = batch[1].shape[1] * n_per_step # Simulate for longer than the batch input. 
+        T = batch[1].shape[1] * self.n_per_step # Simulate for longer than the batch input. 
         self.reset_state(batchSize=batch[0].shape[0])
 
         # Record the final layer
@@ -188,7 +185,7 @@ class VanillaBNN(StatefulBase):
         spk_out = torch.empty(out_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0 # This has to be a float, otherwise causes gradient problems
         
         hidden_size = torch.Size([batch[1].shape[0], T, self.n_hidden]) # [B, T, Nh]
-        self.z1 = torch.empty(hidden_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)
+        self.z1 = torch.empty(hidden_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0
         if debug:
             hidden_size = torch.Size([batch[1].shape[0], batch[1].shape[1], self.n_hidden]) # [B, T, Nh]
             db = {
@@ -196,25 +193,21 @@ class VanillaBNN(StatefulBase):
                 'mem_hidden': torch.empty(hidden_size, dtype=torch.float, device=batch[1].device),
             }
 
-        random_start = np.random.randint(1, T // 10) # This makes us have variable length inputs!
+        random_start = np.random.randint(0, T // 10) # This makes us have variable length inputs!
         for time_idx in range(random_start, T):
-            bidx = time_idx // n_per_step
+            bidx = time_idx // self.n_per_step
             x = batch[0][:, bidx, :] # [B, Nx]
             
             grad_cap = batch[0].shape[1] - self.trunc
             with torch.set_grad_enabled(bidx >= grad_cap):
                 spk_out[:, time_idx, :] = self(x, time_idx, debug=debug)
-                
-#             if debug:
-#                 db['spk_hidden'][:, time_idx, :] = db_step[0]['spk_hidden']
-#                 db['mem_hidden'][:, time_idx, :] = db_step[0]['mem_hidden']
                                 
         self.counter = self.__dict__.get("counter", -1) + 1
         if self.counter % 5 == 0:
             plt.subplot(2,1,1)
             plt.plot(self.z1[0, :, :].detach().cpu())
             plt.subplot(2,1,2)
-            plt.plot(spk_out[0, 1:, :].detach().cpu())
+            plt.plot(spk_out[0, :, :].detach().cpu())
             plt.show()
 
         filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)
