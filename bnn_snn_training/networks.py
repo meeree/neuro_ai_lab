@@ -154,8 +154,8 @@ class VanillaBNN(StatefulBase):
         # Pass input through hidden neurons.
         if self.use_snn:
             spk_hidden, mem_hidden = self.hidden_neurons(z1 + 0.5, self.mem_hidden)
-            self.timers = torch.where(spk_hidden > 0.1, 20, self.timers - 1)
-            spk_hidden = (self.timers > 0).float()
+            # self.timers = torch.where(spk_hidden > 0.1, 20, self.timers - 1)
+            # spk_hidden = (self.timers > 0).float()
         else:
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()

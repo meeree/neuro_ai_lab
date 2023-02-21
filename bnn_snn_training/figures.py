@@ -324,16 +324,9 @@ def fit_lif_hh_fi_curve(T=5000):
 # print(fit_lif_hh_fi_curve(5000))
 # exit()
 
-def analyze_network_discrete(fl = '', toy_params_fl = ''):
+def analyze_network_discrete(folder = ''):
     global toy_params
     import json
-    if len(toy_params_fl) > 0:
-        with open(toy_params_fl) as f:
-            toy_params = json.load(f)    
-            for key, val in toy_params.get('base_word_vals', {}).items():
-                toy_params['base_word_vals'][key] = np.array(val)
-            for key, val in toy_params.get('word_to_input_vector', {}).items():
-                toy_params['word_to_input_vector'][key] = np.array(val)
         
     def plot(net):          
         for i, W in enumerate([net.W_inp, net.W_rec, net.W_ro]):
@@ -345,22 +338,47 @@ def analyze_network_discrete(fl = '', toy_params_fl = ''):
       
     net_params['filter_length'] = 50
     net_params['cuda'] = True
-    net_params['use_snn'] = True
+    net_params['use_snn'] = False
     net_params['n_per_step'] = 40
+    train_params['lr'] = 3e-3
     net = VanillaBNN(net_params, device='cuda').to('cuda')
     init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
     
-    if len(fl) > 0:
-        sd = torch.load(fl)
+    if len(folder) > 0:
+        with open(folder + '/toy_params.json') as f:
+            toy_params = json.load(f)    
+            for key, val in toy_params.get('base_word_vals', {}).items():
+                toy_params['base_word_vals'][key] = np.array(val)
+            for key, val in toy_params.get('word_to_input_vector', {}).items():
+                toy_params['word_to_input_vector'][key] = np.array(val)
+    
+        # Get index of best network and load it
+        import glob
+        fl_names = [os.path.basename(fl) for fl in glob.glob(folder + '/save_*.pt')]
+        fl_names.sort(key = lambda fl: int(fl[5:-3]))
+        sd = torch.load(folder + '/' + fl_names[-1])
+        hist = sd['hist']
+        
+        plt.plot(hist['valid_acc'])
+        plt.show()
+        
+        best_idx = np.argmax(hist['valid_acc'])
+        sd = torch.load(folder + '/' + fl_names[best_idx])
         sd.pop('hist')
         net.load_state_dict(sd)
         net = net.to('cuda')
+        
+        # validData, validOutputMask, _ = syn.generate_data(
+        #     train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
+        #     verbose=False, auto_balance=False, device=device)
     else:
-        net = fit(net, 'BNN_SCALE_10', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False)    
+        net = fit(net, 'BNN_NO_RANDOM_NOISY_3e-3', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False)    
+
+    # fit(net, 'SNN_LONG_FITTED_NO_RANDOM_CONTINUE',  toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False)
 
     # Swap out LIF model instead of HH.
     # net.use_snn = True
-    net.hidden_neurons = get_fit_lif(2.0, 0.0038, 0.05) # Use parameters to fit LIF to HH
+    # net.hidden_neurons = get_fit_lif(2.0, 0.0038, 0.05) # Use parameters to fit LIF to HH
     
     testData, testOutputMask, _ = syn.generate_data(
             test_set_size, toy_params, net_params['n_outputs'], 
