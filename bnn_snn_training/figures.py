@@ -324,8 +324,9 @@ def fit_lif_hh_fi_curve(T=5000):
 # print(fit_lif_hh_fi_curve(5000))
 # exit()
 
-def analyze_network_discrete(folder = ''):
+def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     global toy_params
+    global trainData, validData, trainOutputMask, validOutputMask
     import json
         
     def plot(net):          
@@ -340,12 +341,26 @@ def analyze_network_discrete(folder = ''):
     net_params['cuda'] = True
     net_params['use_snn'] = False
     net_params['n_per_step'] = 40
-    train_params['lr'] = 3e-3
-    net = VanillaBNN(net_params, device='cuda').to('cuda')
-    init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
+    train_params['lr'] = 1e-3
+    train_params['batch_size'] *= 2
     
-    if len(folder) > 0:
-        with open(folder + '/toy_params.json') as f:
+    # SNN setup
+    # net_params['filter_length'] = 20
+    # net_params['cuda'] = False
+    # net_params['use_snn'] = True
+    # net_params['n_per_step'] = 20
+    # train_params['lr'] = 1e-3
+    
+    net = VanillaBNN(net_params, device='cuda').to('cuda')
+    # net.trunc = 10
+    init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
+    init_W_ro = net.W_ro.weight.data.clone().cpu().detach().numpy()
+    init_W_inp = net.W_inp.weight.data.clone().cpu().detach().numpy()
+    
+    folder_full = 'SAVES/' + folder
+    if len(folder) > 0 and os.path.exists(folder_full):
+        # Load folder of saved data and find best or specific epoch for network to load.
+        with open(folder_full + '/toy_params.json') as f:
             toy_params = json.load(f)    
             for key, val in toy_params.get('base_word_vals', {}).items():
                 toy_params['base_word_vals'][key] = np.array(val)
@@ -354,38 +369,46 @@ def analyze_network_discrete(folder = ''):
     
         # Get index of best network and load it
         import glob
-        fl_names = [os.path.basename(fl) for fl in glob.glob(folder + '/save_*.pt')]
+        fl_names = [os.path.basename(fl) for fl in glob.glob(folder_full + '/save_*.pt')]
         fl_names.sort(key = lambda fl: int(fl[5:-3]))
-        sd = torch.load(folder + '/' + fl_names[-1])
+        sd = torch.load(folder_full + '/' + fl_names[-1])
         hist = sd['hist']
+        plot_accuracy(hist)
         
-        plt.plot(hist['valid_acc'])
-        plt.show()
-        
-        best_idx = np.argmax(hist['valid_acc'])
-        sd = torch.load(folder + '/' + fl_names[best_idx])
+        if specific_epoch >= 0:
+            net_idx = specific_epoch
+        else:
+            net_idx = np.argmax(hist['avg_valid_acc'])
+            
+        fl = folder_full + '/save_' + str(net_idx) + '.pt'
+        sd = torch.load(fl)
         sd.pop('hist')
         net.load_state_dict(sd)
         net = net.to('cuda')
+
+    if train:
+        # Regenerate the train/validation sets and train. 
+        trainData, trainOutputMask, toy_params = syn.generate_data(
+            train_params['train_set_size'], toy_params, net_params['n_outputs'], 
+            verbose=True, auto_balance=False, device=device)
         
-        # validData, validOutputMask, _ = syn.generate_data(
-        #     train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
-        #     verbose=False, auto_balance=False, device=device)
-    else:
-        net = fit(net, 'BNN_NO_RANDOM_NOISY_3e-3', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False)    
-
-    # fit(net, 'SNN_LONG_FITTED_NO_RANDOM_CONTINUE',  toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False)
-
+        validData, validOutputMask, _ = syn.generate_data(
+            train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
+            verbose=False, auto_balance=False, device=device)
+            
+        net = fit(net, 'CONTINUE_OLD_1e-3', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
+        
     # Swap out LIF model instead of HH.
     # net.use_snn = True
     # net.hidden_neurons = get_fit_lif(2.0, 0.0038, 0.05) # Use parameters to fit LIF to HH
     
+    # Evaluation and analysis of model.
     testData, testOutputMask, _ = syn.generate_data(
             test_set_size, toy_params, net_params['n_outputs'], 
             verbose=False, auto_balance=False, device='cuda')
+    
     labels = np.array(testData[:,:,:][1][:, -1, 0].cpu())
     db = eval_on_test_set(net, testData)
-    # plot_accuracy(net)
     accuracy = net.accuracy(testData[:,:,:], outputMask=testOutputMask)
     print('Accuracy: ', accuracy.item())
     spk_hidden = db['spk_hidden'].detach().cpu().numpy()
@@ -414,6 +437,12 @@ def analyze_network_discrete(folder = ''):
         ax3.set_title('$V$')
         plt.show()
     svd_analysis()
+    
+    W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
+    W_ro = net.W_ro.weight.data.clone().cpu().detach().numpy()
+    W_inp = net.W_inp.weight.data.clone().cpu().detach().numpy()
+    
+    print(np.linalg.norm(W_rec - init_W_rec) / np.linalg.norm(init_W_rec), np.linalg.norm(W_ro - init_W_ro) / np.linalg.norm(init_W_ro), np.linalg.norm(W_inp - init_W_inp) / np.linalg.norm(init_W_inp))
     
     means_out = np.zeros((3, spk_out.shape[1], 3))
     n_hit = np.zeros(3)
@@ -516,13 +545,12 @@ def analyze_network_discrete(folder = ''):
     plt.show()
    
     spk_hidden = net.z1.detach().cpu().numpy()
-    hidden_conv = sliding_window_states(200, spk_hidden)
+    hidden_conv = sliding_window_states(net.filter_len, spk_hidden)
     PR, hs_pca, pca_handler = PCA_dim(hidden_conv)
     print(PR)
     plot_pca(hs_pca, labels = np.array(testData[:,:,:][1][:, -1, 0].cpu()))
     
 
-analyze_network_discrete()    
-# analyze_network_discrete('SAVES/TRAIN_GNA_NOISY_SHORT_40_save_No_Delay_unregulated_3001.pt', 'SAVES/TRAIN_GNA_NOISY_SHORT_40_toy_params_No_Delay_unregulated.json')
-# analyze_network_discrete('SAVES/REGULARIZED_NOISY_SHORT_40_save_No_Delay_unregulated_2524.pt', 'SAVES/REGULARIZED_NOISY_SHORT_40_toy_params_No_Delay_unregulated.json')
-analyze_network_discrete('../../integrators/SAVES/NOISY_SHORT_40_save_No_Delay_unregulated_2830.pt', '../../integrators/SAVES/NOISY_SHORT_40_toy_params_No_Delay_unregulated.json')
+# analyze_network_discrete('SNN_500ts_1e-3', False)
+analyze_network_discrete('OLD_WORKING_NOISY_SHORT_40_1e-3/', True, specific_epoch = 2830)    
+analyze_network_discrete('BNN_NO_RANDOM_NOISY_1e-2/')    

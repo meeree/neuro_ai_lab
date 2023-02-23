@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import sys
 sys.path.append('mpn') 
 from net_utils import StatefulBase, xe_classifier_accuracy
+from utils import plot_accuracy
 
 class HH(torch.jit.ScriptModule):
     def __init__(self, L, device):
@@ -149,11 +150,11 @@ class VanillaBNN(StatefulBase):
         cur_inp = self.W_inp(x)
         cur_rec = self.W_rec(self.spk_hidden)
         z1 = cur_inp + cur_rec
-        z1 = z1 + torch.normal(torch.zeros_like(z1), 1.0)
+        z1 = z1 + torch.normal(torch.zeros_like(z1), 0.0)
         
         # Pass input through hidden neurons.
         if self.use_snn:
-            spk_hidden, mem_hidden = self.hidden_neurons(z1 + 0.5, self.mem_hidden)
+            spk_hidden, mem_hidden = self.hidden_neurons(z1, self.mem_hidden)
             # self.timers = torch.where(spk_hidden > 0.1, 20, self.timers - 1)
             # spk_hidden = (self.timers > 0).float()
         else:
@@ -200,6 +201,10 @@ class VanillaBNN(StatefulBase):
             plt.subplot(2,1,2)
             plt.plot(spk_out[0, :, :].detach().cpu())
             plt.show()
+            
+            if self.hist is not None and len(self.hist['train_loss']) > 0:
+                plt.plot(self.hist['train_loss'])
+                plt.show()
 
         filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)
         spk_out_conv = torch.transpose(spk_out, 1, 2) # B, T, Ny -> B, Ny, T (for convolve along dim=2)
