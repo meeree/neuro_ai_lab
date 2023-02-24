@@ -47,7 +47,7 @@ net_params = {
 }
 
 train_params = {
-    'epochs': 300,
+    'epochs': 1000,
 
     'batch_size': 64,
     'train_set_size': 3200,
@@ -328,6 +328,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     global toy_params
     global trainData, validData, trainOutputMask, validOutputMask
     import json
+    torch.cuda.set_device(0) # SPECIFY CUDA DEVICE TO USE
         
     def plot(net):          
         for i, W in enumerate([net.W_inp, net.W_rec, net.W_ro]):
@@ -341,8 +342,10 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     net_params['cuda'] = True
     net_params['use_snn'] = False
     net_params['n_per_step'] = 40
-    train_params['lr'] = 1e-3
+    train_params['lr'] = 5e-3
     train_params['batch_size'] *= 2
+    net_params['n_hidden'] *= 2
+    train_params['scheduler'] = 'reducePlateau'
     
     # SNN setup
     # net_params['filter_length'] = 20
@@ -396,7 +399,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
             verbose=False, auto_balance=False, device=device)
             
-        net = fit(net, 'CONTINUE_OLD_1e-3', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
+        net = fit(net, 'TRAIN_5e-3_PLATEAU_SCHEDULE0.5_256H', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
         
     # Swap out LIF model instead of HH.
     # net.use_snn = True
@@ -551,6 +554,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     plot_pca(hs_pca, labels = np.array(testData[:,:,:][1][:, -1, 0].cpu()))
     
 
-# analyze_network_discrete('SNN_500ts_1e-3', False)
+analyze_network_discrete('', True)
+analyze_network_discrete('TRAIN_1e-2_PLATEAU_SCHEDULE', False)
 analyze_network_discrete('OLD_WORKING_NOISY_SHORT_40_1e-3/', True, specific_epoch = 2830)    
 analyze_network_discrete('BNN_NO_RANDOM_NOISY_1e-2/')    

@@ -47,16 +47,17 @@ def fit(net, folder_name, toy_params, net_params, train_params, trainData, valid
                 gradientClip=train_params['gradient_clip'],
                 monitorFreq=train_params['monitorFreq'], 
                 trainOutputMask=trainOutputMask, validOutputMask=validOutputMask, 
+                scheduler=train_params['scheduler'],
                 filename = f'{folder}/save')
     return net
 
-def plot_accuracy(net):
+def plot_accuracy(hist):
     plt.figure(figsize = (8, 3))
     plt.subplot(1,2,1)
     ax1 = plt.gca()
-    ax1.plot(net.hist['iters_monitor'], net.hist['train_loss'], color=c_vals[0], label='Train')
-    ax1.plot(net.hist['iters_monitor'], net.hist['valid_loss'], color=c_vals[1], label='Test')
-    ax1.plot(net.hist['iters_monitor'], net.hist['avg_valid_loss'], color=c_vals[2], label='Avg Test')
+    ax1.plot(hist['iters_monitor'], hist['train_loss'], color=c_vals[0], label='Train')
+    ax1.plot(hist['iters_monitor'], hist['valid_loss'], color=c_vals[1], label='Test')
+    ax1.plot(hist['iters_monitor'], hist['avg_valid_loss'], color=c_vals[2], label='Avg Test')
     
     ax1.set_xlabel('Step')
     ax1.set_ylabel('Loss (XE)')
@@ -65,10 +66,10 @@ def plot_accuracy(net):
     
     plt.subplot(1,2,2)
     ax1 = plt.gca()
-    ax1.plot(net.hist['iters_monitor'], net.hist['train_acc'], color=c_vals[0], label='Train')
-    ax1.plot(net.hist['iters_monitor'], net.hist['valid_acc'], color=c_vals[1], label='Test')
-    ax1.plot(net.hist['iters_monitor'], net.hist['avg_valid_acc'], color=c_vals[2], label='Avg Test')
-    max_acc = max(net.hist['valid_acc'])
+    ax1.plot(hist['iters_monitor'], hist['train_acc'], color=c_vals[0], label='Train')
+    ax1.plot(hist['iters_monitor'], hist['valid_acc'], color=c_vals[1], label='Test')
+    ax1.plot(hist['iters_monitor'], hist['avg_valid_acc'], color=c_vals[2], label='Avg Test')
+    max_acc = max(hist['valid_acc'])
     ax1.axhline(max_acc, color='k', linestyle='dashed', c = 'red')
     ax1.text(0, max_acc*1.03, f'{max_acc:.3f}', c = 'red')
     
