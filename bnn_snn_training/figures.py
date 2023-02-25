@@ -253,8 +253,12 @@ def get_fit_lif(I0, freq, fudge = 0.99, debug = False):
     
     return lif
 
-# get_fit_lif(0.1, 0.006, 0.99, True)
-# exit()
+## Should give beta = 0.95, thresh = 1.0
+# lif_95 = get_fit_lif(0.05005, 1.0 / 134.6717, 0.999, True) 
+# print(lif_95.beta, lif_95.threshold) 
+# lif_10x_slower = get_fit_lif(0.05005, 0.1 / 134.6717, 0.999, True) 
+# print(lif_10x_slower.beta, lif_10x_slower.threshold) 
+
 
 def fit_lif_hh_fi_curve(T=5000):
     ''' Fit an LIF neuron to an HH neuron using F-I curves. '''
@@ -321,14 +325,14 @@ def fit_lif_hh_fi_curve(T=5000):
 
     return max_I0, max_freq, best_fudge
     
-# print(fit_lif_hh_fi_curve(5000))
+# print(fit_lif_hh_fi_curve())
 # exit()
 
 def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     global toy_params
     global trainData, validData, trainOutputMask, validOutputMask
     import json
-    torch.cuda.set_device(0) # SPECIFY CUDA DEVICE TO USE
+    torch.cuda.set_device(1) # SPECIFY CUDA DEVICE TO USE
         
     def plot(net):          
         for i, W in enumerate([net.W_inp, net.W_rec, net.W_ro]):
@@ -338,13 +342,15 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             plt.yticks([])
         plt.show()
       
+    toy_params['phrase_length'] = 50
     net_params['filter_length'] = 50
     net_params['cuda'] = True
     net_params['use_snn'] = False
     net_params['n_per_step'] = 40
+    net_params['loss_fn'] = 'mse'
     train_params['lr'] = 5e-3
     train_params['batch_size'] *= 2
-    net_params['n_hidden'] *= 2
+    # net_params['random_start'] = 500
     train_params['scheduler'] = 'reducePlateau'
     
     # SNN setup
@@ -355,6 +361,12 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     # train_params['lr'] = 1e-3
     
     net = VanillaBNN(net_params, device='cuda').to('cuda')
+    # for name, param in net.named_parameters():
+    #     param.data *= 5
+    
+    lif_10x_slower = get_fit_lif(0.05005, 0.1 / 134.6717, 0.999) 
+    # net.hidden_neurons = lif_10x_slower
+    
     # net.trunc = 10
     init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
     init_W_ro = net.W_ro.weight.data.clone().cpu().detach().numpy()
@@ -399,7 +411,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
             verbose=False, auto_balance=False, device=device)
             
-        net = fit(net, 'TRAIN_5e-3_PLATEAU_SCHEDULE0.5_256H', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
+        net = fit(net, 'TRAIN_5e-3_MSE_LOSS_PLATEAU0.5', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
         
     # Swap out LIF model instead of HH.
     # net.use_snn = True
@@ -520,7 +532,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     plt.tight_layout()
     plt.show()
     
-    smooth_means_out = sliding_window_states(200, means_out)
+    smooth_means_out = sliding_window_states(net_params['n_per_step'] * 20, means_out)
     plt.figure(figsize=(9,9))
     for i in range(3):
         for j in range(3):
@@ -550,11 +562,14 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     spk_hidden = net.z1.detach().cpu().numpy()
     hidden_conv = sliding_window_states(net.filter_len, spk_hidden)
     PR, hs_pca, pca_handler = PCA_dim(hidden_conv)
-    print(PR)
+    print('PCA Dimensionality Estimate', PR)
     plot_pca(hs_pca, labels = np.array(testData[:,:,:][1][:, -1, 0].cpu()))
     
-
 analyze_network_discrete('', True)
+analyze_network_discrete('TRAIN_5e-3_SHORT_50ts', False)
+exit()
+
+analyze_network_discrete('TRAIN_5e-3_PLATEAU_SCHEDULE0.5/', False)
 analyze_network_discrete('TRAIN_1e-2_PLATEAU_SCHEDULE', False)
 analyze_network_discrete('OLD_WORKING_NOISY_SHORT_40_1e-3/', True, specific_epoch = 2830)    
 analyze_network_discrete('BNN_NO_RANDOM_NOISY_1e-2/')    

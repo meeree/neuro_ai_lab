@@ -101,6 +101,11 @@ class VanillaBNN(StatefulBase):
         self.n_outputs = net_params['n_outputs']
         
         self.loss_fn = F.cross_entropy # Reductions is mean by default
+        if net_params.get('loss_fn', '') == 'mse':
+            def mse_loss(x, y):
+                one_hot = F.one_hot(y, num_classes = self.n_outputs).float()
+                return F.mse_loss(x, one_hot)
+            self.loss_fn = mse_loss
         self.acc_fn = xe_classifier_accuracy
         
         # Uses a given filter to convolve the the spike counts over time. 
@@ -161,7 +166,7 @@ class VanillaBNN(StatefulBase):
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()
 
-        self.z1[:, t, :] = spk_hidden
+        self.z1[:, t, :] = mem_hidden
         
         z2 = self.W_ro(spk_hidden)
         spk_output = F.softmax(z2, dim = -1) # No output neurons!
@@ -197,7 +202,7 @@ class VanillaBNN(StatefulBase):
         self.counter = self.__dict__.get("counter", -1) + 1
         if self.counter % 5 == 0:
             plt.subplot(2,1,1)
-            plt.plot(self.z1[0, :, :].detach().cpu())
+            plt.plot(self.z1[0, :, 0].detach().cpu())
             plt.subplot(2,1,2)
             plt.plot(spk_out[0, :, :].detach().cpu())
             plt.show()

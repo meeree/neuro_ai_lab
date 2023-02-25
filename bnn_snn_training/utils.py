@@ -47,7 +47,7 @@ def fit(net, folder_name, toy_params, net_params, train_params, trainData, valid
                 gradientClip=train_params['gradient_clip'],
                 monitorFreq=train_params['monitorFreq'], 
                 trainOutputMask=trainOutputMask, validOutputMask=validOutputMask, 
-                scheduler=train_params['scheduler'],
+                scheduler=train_params.get('scheduler', None),
                 filename = f'{folder}/save')
     return net
 
@@ -69,7 +69,7 @@ def plot_accuracy(hist):
     ax1.plot(hist['iters_monitor'], hist['train_acc'], color=c_vals[0], label='Train')
     ax1.plot(hist['iters_monitor'], hist['valid_acc'], color=c_vals[1], label='Test')
     ax1.plot(hist['iters_monitor'], hist['avg_valid_acc'], color=c_vals[2], label='Avg Test')
-    max_acc = max(hist['valid_acc'])
+    max_acc = max(hist['avg_valid_acc'])
     ax1.axhline(max_acc, color='k', linestyle='dashed', c = 'red')
     ax1.text(0, max_acc*1.03, f'{max_acc:.3f}', c = 'red')
     
