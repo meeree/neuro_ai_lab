@@ -6,3 +6,6 @@ Code related to training and working with the resonate-and-fire (RF) neuronal mo
 
 # bnn_snn_training 
 Code related to training BNNs (biophysical neural networks) and SNNs (spiking neural networks) on a variety of tasks. Pretty unorganized at the moment. The main code to generate figures is in figures.py. 
+ 
+# neuron_playground
+Code for simulating and playing with individual neuron models such as Hodgkin-Huxley, Moris Lecar, etc with different ODE methods and different analysis methods such as raster plots and ISI histograms. I would like to eventually build a GUI for this specific part of the code.
