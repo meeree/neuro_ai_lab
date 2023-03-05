@@ -6,14 +6,14 @@ class HH_Like():
         import sympy as sp
 
         # Variables
-        self.V = np.zeros(N)
+        self.V = np.zeros(N) - 70
         self.channel_names = list(channels.keys())
         self.channels_currents = np.zeros((len(channels), N))
 
         self.gating_var_names = list(gating_vars.keys())
         self.gating_vars = np.zeros((len(gating_vars), N))
-        self.gating_alpha = np.zeros_like(self.gating_vars)
-        self.gating_beta = np.zeros_like(self.gating_vars)
+        self.infs = np.zeros_like(self.gating_vars)
+        self.taus = np.zeros_like(self.gating_vars)
 
         # Constants
         self.conductances = np.array([np.ones_like(self.V) * vals['conductance'] for vals in channels.values()])
@@ -27,31 +27,38 @@ class HH_Like():
             if 'gating_term' in vals:
                 # Convert string to a lambda that extracts gating variables by index and evaluates gating term.
                 expr = sp.sympify(vals['gating_term'])
-                gating_vars_used = list(expr.free_symbols)
-                inds = [self.gating_var_names.index(str(g)) for g in gating_vars_used]
+                gating_vars_used = [str(g) for g in list(expr.free_symbols)]
+                use_inf = np.array([('inf' in g) for g in gating_vars_used])
+                print(use_inf, name)
+                gating_vars_used = [g.replace('inf', '') for g in gating_vars_used]
+                inds = [self.gating_var_names.index(g) for g in gating_vars_used]
                 expr_fn = sp.lambdify(gating_vars_used, expr)
-            setup.append((expr_fn, inds))
+            setup.append((expr_fn, inds, use_inf))
 
-        self.update_gating_terms = lambda G: np.array([fn(*G[inds]) for fn, inds in setup])
+        self.update_gating_terms = lambda G, Ginf: np.array([fn(*G[inds]) for fn, inds, use_inf in setup])
 
-        # Each update_alpha/beta function : voltage -> alpha/beta term, respectively.
-        update_alphas, update_betas = [], []
+        # Each update_inf/tau function : voltage -> inf/tau term for gating variable, respectively.
+        update_infs, update_taus = [], []
         for name, vals in gating_vars.items():
-            for term, out_list in zip(['alpha', 'beta'], [update_alphas, update_betas]):
+            for term, out_list in zip(['inf', 'tau'], [update_infs, update_taus]):
                 expr = sp.sympify(vals[term])
                 syms = list(expr.free_symbols)
                 assert(len(syms) == 1 and str(syms[0]) == 'V')
                 out_list.append(sp.lambdify(syms, expr))
-        self.update_alphas = lambda V: np.array([fn(V) for fn in update_alphas])
-        self.update_betas = lambda V: np.array([fn(V) for fn in update_betas])
+        self.update_infs = lambda V: np.array([fn(V) for fn in update_infs])
+        self.update_taus = lambda V: np.array([fn(V) for fn in update_taus])
 
     def trapezoid(self, dt, Iapp):
-        self.alphas = self.update_alphas(self.V)
-        self.betas = self.update_betas(self.V)
+        self.infs = self.update_infs(self.V)
+        self.taus = self.update_taus(self.V)
 
         # Trapezoid rule update for gating variables.
-        self.gating_vars = (self.alphas * dt + (1 - dt/2 * (self.alphas + self.betas))*self.gating_vars) / (dt/2 * (self.alphas + self.betas) + 1)
-        terms = self.update_gating_terms(self.gating_vars) * self.conductances
+        self.gating_vars = (self.infs * dt + (self.taus - dt/2) * self.gating_vars) / (self.taus + dt/2)
+
+        # Update gating variable terms by computing g * m^a * h^b for each term (a, b vary).
+        terms = self.update_gating_terms(self.gating_vars, self.infs) * self.conductances
+
+        # Update V using channel currents and inputted current/noise.
         self.channel_currents = terms * (self.V - self.reversals) # For analysis, not used.
         G = np.sum(terms, 0)
         E = np.sum(terms * self.reversals, 0)
@@ -61,11 +68,11 @@ class HH_Like():
 
     def dxdt(self, V, gating_vars, Iapp):
         ''' Compute derivative of states: voltage and gating variables. '''
-        self.alphas = self.update_alphas(V)
-        self.betas = self.update_betas(V)
-        dGdt = self.alphas * (1 - gating_vars) - self.betas * gating_vars
+        self.infs = self.update_infs(V)
+        self.taus = self.update_taus(V)
+        dGdt = (self.infs - gating_vars) / self.taus
 
-        terms = self.update_gating_terms(gating_vars) * self.conductances
+        terms = self.update_gating_terms(gating_vars, self.infs) * self.conductances
         self.channel_currents = terms * (V - self.reversals)
         dVdt = Iapp - np.sum(self.channel_currents, 0)
         return dVdt, dGdt
@@ -89,52 +96,117 @@ class HH_Like():
         sim_fn = self.trapezoid if method == 'trapezoid' else self.rk4
         for t in tqdm(range(T)):
             to_record(t)
-            self.rk4(dt, Iapp[t])
-#            self.trapezoid(dt, Iapp)
+            sim_fn(dt, Iapp[t])
 
         return record
 
-channels = \
-{
-        'Na': {'gating_term': 'm**3 * h', 'conductance': 40.0, 'reversal': 55.0}, 
-        'K' : {'gating_term': 'n**4', 'conductance': 35.0, 'reversal': -77.0}, 
-        'L': {'conductance': 0.3, 'reversal': -65.0}, 
-}
+def vanilla_hh():
+    channels = \
+    {
+            'Na': {'gating_term': 'm**3 * h', 'conductance': 40.0, 'reversal': 55.0}, 
+            'K' : {'gating_term': 'n**4', 'conductance': 35.0, 'reversal': -77.0}, 
+            'L': {'conductance': 0.3, 'reversal': -65.0}, 
+    }
+    gating_vars = \
+    {
+#        'm': 
+#           {'alpha': '0.182 * (V + 35) / (1 - exp((-V - 35) / 9))',
+#            'beta': '-0.124 * (V + 35) / (1 - exp((V + 35) / 9))'},
+#        'n': 
+#           {'alpha': '0.02 * (v - 25) / (1 - exp((-v + 25) / 9))',
+#            'beta': '-0.002 * (V - 25) / (1 - exp((V - 25) / 9))'},
+#        'h': 
+#           {'alpha': '0.25 * exp((-V - 90.0) / 12.0)',
+#            'beta': '0.25 * exp((V + 34) / 12.0)'},
 
-gating_vars = \
-{
-    'm': 
-       {'alpha': '0.182 * (V + 35) / (1 - exp((-V - 35) / 9))',
-        'beta': '-0.124 * (V + 35) / (1 - exp((V + 35) / 9))'},
-    'n': 
-       {'alpha': '0.02 * (V - 25) / (1 - exp((-V + 25) / 9))',
-        'beta': '-0.002 * (V - 25) / (1 - exp((V - 25) / 9))'},
-    'h': 
-       {'alpha': '0.25 * exp((-V - 90.0) / 12.0)',
-        'beta': '0.25 * exp((V + 34) / 12.0)'},
-}
+        'm': 
+           {'inf': '(0.182 * (V + 35) / (1 - exp((-V - 35) / 9))) / (0.182 * (V + 35) / (1 - exp((-V - 35) / 9)) + -0.124 * (V + 35) / (1 - exp((V + 35) / 9)))',
+            'tau': '1 / (0.182 * (V + 35) / (1 - exp((-V - 35) / 9)) + -0.124 * (V + 35) / (1 - exp((V + 35) / 9)))'},
+        'n': 
+           {'inf': '(0.02 * (V - 25) / (1 - exp((-V + 25) / 9))) / (0.25 * exp((-V - 90.0) / 12.0) + -0.002 * (V - 25) / (1 - exp((V - 25) / 9)))',
+            'tau': '1 / (0.25 * exp((-V - 90.0) / 12.0) + -0.002 * (V - 25) / (1 - exp((V - 25) / 9)))'},
+        'h': 
+           {'inf': '(0.25 * exp((-V - 90.0) / 12.0)) / (0.25 * exp((-V - 90.0) / 12.0) + 0.25 * exp((V + 34) / 12.0))',
+            'tau': '1 / (0.25 * exp((-V - 90.0) / 12.0) + 0.25 * exp((V + 34) / 12.0))'},
+    }
+    return channels, gating_vars
+
+def squid_giant_axon():
+#    channels = \
+#    {
+#            'Na': {'gating_term': 'm**3 * h', 'conductance': 120.0, 'reversal': 120.0-65}, 
+#            'K' : {'gating_term': 'n**4', 'conductance': 36.0, 'reversal': -12.0-65}, 
+#            'L': {'conductance': 0.3, 'reversal': 10.6-65}, 
+#    }
+    channels = \
+    {
+            'Na': {'gating_term': 'm**3 * h', 'conductance': 40.0, 'reversal': 55.0}, 
+            'K' : {'gating_term': 'n**4', 'conductance': 35.0, 'reversal': -77.0}, 
+            'L': {'conductance': 0.3, 'reversal': -65}, 
+    }
+    gating_vars = \
+    {
+        'm': 
+           {'inf': '1 / (1 + exp((-40 - V)/15))', 
+            'tau': '0.04 + 0.46 * exp(-(-38-V)**2 / 30**2)'},
+        'n': 
+           {'inf': '1 / (1 + exp((-53 - V)/15))', 
+            'tau': '1.1 + 4.7 * exp(-(-79-V)**2 / 50**2)'},
+        'h': 
+           {'inf': '1 / (1 + exp((-62 - V)/-7))', 
+            'tau': '1.2 + 7.4 * exp(-(-67-V)**2 / 20**2)'},
+#        'm': 
+#           {'inf': '(0.1 * (25 - V) / (exp((25-V)/10) - 1)) / (0.1 * (25 - V) / (exp((25-V)/10) - 1) + 4 * exp(-V/18))', 
+#            'tau': '1 / (0.1 * (25 - V) / (exp((25-V)/10) - 1) + 4 * exp(-V/18))'},
+#        'n': 
+#           {'inf': '(0.01 * (V - 10) / (1 - exp((10-V) / 10))) / (0.01 * (V - 10) / (1 - exp((10-V) / 10)) + 0.125 * exp(-V/80))', 
+#            'tau': '1 / (0.01 * (V - 10) / (1 - exp((10-V) / 10)) + 0.125 * exp(-V/80))'},
+#        'h': 
+#           {'inf': '0.07*exp(-V/20) / (0.07*exp(-V/20) + 1/(exp((30-V)/10) + 1))', 
+#            'tau': '1 / (0.07*exp(-V/20) + 1/(exp((30-V)/10) + 1))'},
+    }
+    return channels, gating_vars
+#        'm': 
+#           {'alpha': '0.1 * (25 - V) / (exp((25-V)/10) - 1)',
+#            'beta': '4 * exp(-V/18)'},
+#        'n': 
+#           {'alpha': '0.01 * (V - 10) / (1 - exp((10-V) / 10))',
+#            'beta': '0.125 * exp(-V/80)'},
+#        'h': 
+#           {'alpha': '0.07*exp(-V/20)',
+#            'beta': '1/(exp((30-V)/10) + 1)'},
+
 
 from matplotlib import pyplot as plt
-hh = HH_Like(1, channels, gating_vars)
+channels, gating_vars = vanilla_hh()
 
 record = []
+Iapps = []
 for method, dt, T in zip(['trapezoid', 'rk4'], [0.1, 0.01], [10**3, 10**4]):
-    Iapp = np.zeros(T)
-    inp_len = 5 if method == 'trapezoid' else 50
-    Iapp[5*T//10:5*T//10+inp_len] = 20.0
-    Iapp[7*T//10:7*T//10+inp_len] = 20.0
+    hh = HH_Like(1, channels, gating_vars)
+    Iapp = np.ones(T) * 1
+    Iapp[:int(30 / dt)] = 0.0
     record.append(hh.simulate_and_record(T, Iapp, dt, method))
+    Iapps.append(Iapp)
     print(record[-1].shape)
 
 record[1] = record[1][:, ::10, :] # Subsample since RK4 has 10 times smaller dt.
 
 for i in range(2):
-    plt.subplot(2,1,1+i)
     r = record[i]
-    r = r[:, 100:, :]
+    r = r[:, :, :]
+
+    plt.subplot(2,3,1+3*i)
+    plt.plot(r[0, :, 0], c='black')
+#    ax = plt.gca().twinx()
+#    ax.plot(Iapps[i])
+#    plt.yticks([])
+
+    plt.subplot(2,3,2+3*i)
+    plt.plot(r[1:, :, 0].T, linestyle='--')
+
+    plt.subplot(2,3,3+3*i)
     plt.plot(r[0, :, 0], np.sum(r[1:, :, 0],0))
 
-#    plt.plot(r[0, :, 0])
-#    ax = plt.gca().twinx()
-#    ax.plot(r[1:, :, 0].T)
+plt.tight_layout()
 plt.show()
