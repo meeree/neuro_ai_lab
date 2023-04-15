@@ -91,6 +91,112 @@ class HH(torch.jit.ScriptModule):
         self.T = torch.sigmoid((self.V - self.Vt) / self.Kp)
         return self.T
     
+class HH_Fast(torch.jit.ScriptModule):
+    def __init__(self, L, device):
+        super().__init__()
+        self.L = L
+        
+        # State varaibles. V is the voltage B, [L], B batch size, L layer count, 
+        # K is the gating variables [3, B, L], T is the output [B, L].
+        self.V = self.K = self.T = torch.ones(()) 
+        
+        # HH parameters. These can be tweaked after initializing the HH model.
+        self.gna = 120.0; self.gk = 36.0; self.gl = 0.3;
+        self.Ena = 55.0; self.Ek = -77.0; self.El = -65;
+        self.Iapp = 0.0; self.Vt = -3.0; self.Kp = 8.0; 
+        self.dt = 0.1;
+        self.device = device
+        
+        # Offsets and divisors for gating variable update rates.
+        # For their uses, see below.
+        self.inf_V12 = torch.tensor([-40., -53., -62.]).view(-1, 1, 1).to(self.device) 
+        self.inf_k = torch.tensor([15., 15., -7.]).view(-1, 1, 1).to(self.device)
+        self.tau_base = torch.tensor([0.04, 1.1, 1.2]).view(-1, 1, 1).to(self.device)
+        self.tau_amp = torch.tensor([0.46, 4.7, 7.4]).view(-1, 1, 1).to(self.device)
+        self.tau_Vmax = torch.tensor([-38., -79., -67.]).view(-1, 1, 1).to(self.device)
+        self.tau_var = torch.tensor([30., 50., 20.]).view(-1, 1, 1).to(self.device) # STD NOT VARIANCE
+
+        # DONT DO THIS STEP YOURSELF ! 
+        self.tau_var = self.tau_var ** 2 # Variance, not STDDEV!
+        
+    def reset_state(self, B, randomize=True):
+        self.V = torch.ones((B, self.L)).to(self.device) * -65.0
+        if randomize:
+            self.V += torch.normal(torch.zeros_like(self.V), 5.0) # Add some noise to initial conditions.
+        self.T = torch.zeros_like(self.V).to(self.device)
+                
+        # Gating variables
+        self.K = torch.zeros((3, B, self.L)).to(self.device)
+
+    @torch.jit.script_method
+    def forward(self, z):
+        ''' Pass input through HH for one timestep. z should be shape [batch size, neuron count]'''
+        ''' Input k is the NEXT timestep we are considering. Should start at 1. '''
+        # Optimization: concatenate all gating variables in one big tensor since their updates are very similar.
+        m = self.K[0, :, :]
+        n = self.K[1, :, :]
+        h = self.K[2, :, :]
+
+        # Calculate V intermediate channel quantities.
+        pow1 = self.gna * (m ** 3) * h
+        pow2 = self.gk * n ** 4
+        G_scaled = (self.dt / 2) * (pow1 + pow2 + self.gl)
+        E = pow1 * self.Ena + pow2 * self.Ek + self.gl * self.El
+
+        # V update.
+        self.V = (self.dt * (E + self.Iapp + z) +  (1 - G_scaled) * self.V.clone()) / (1 + G_scaled)
+
+        # Calculate gating variable intermediate rate quantities.
+        inf = torch.sigmoid((self.V - self.inf_V12) / self.inf_k)
+        tau = self.tau_base + self.tau_amp * torch.exp(-(self.tau_Vmax - self.V) / self.tau_var)
+
+        # Gating Variable update.
+        self.K = (inf * self.dt + (tau - self.dt/2) * self.K) / (tau + self.dt/2)
+        self.T = torch.sigmoid((self.V - self.Vt) / self.Kp)
+        return self.T
+    
+class MorrisLecar(torch.jit.ScriptModule):
+    def __init__(self, L, device, phi = 0.04, V1 = -1.2, V2 = 18., V3 = 2., V4 = 30., C = 20.):
+        super().__init__()
+        self.L = L
+        
+        # State varaibles. V is the voltage B, [L], B batch size, L layer count, 
+        # K is the gating variables [3, B, L], T is the output [B, L].
+        self.V = self.w = self.T = torch.ones(()) 
+        
+        # ML Parameters.
+        self.phi = phi; self.V1 = V1; self.V2 = V2; self.V3 = V3; self.V4 = V4;
+        self.C = C
+        self.dt = 0.1; self.Vt = -3.0; self.Kp = 8.0; 
+        self.device = device
+        self.Iapp = 0.0
+        
+    def reset_state(self, B, randomize=True):
+        self.V = torch.ones((B, self.L)).to(self.device) * -20.0 
+        if randomize:
+            self.V += torch.normal(torch.zeros_like(self.V), 5.0) # Add some noise to initial conditions.
+        self.T = torch.zeros_like(self.V).to(self.device)
+                
+        # Gating variables
+        self.w = torch.ones((B, self.L)).to(self.device) * 0.014173
+
+    @torch.jit.script_method
+    def forward(self, z):
+        minf = 0.5 * (1 + torch.tanh((self.V - self.V1) / self.V2))
+        winf = 0.5 * (1 + torch.tanh((self.V - self.V3) / self.V4))
+        tauw = 1. / (self.phi * torch.cosh((self.V - self.V3) / (2 * self.V4)))
+        self.w = (winf * self.dt + (tauw - self.dt/2) * self.w) / (tauw + self.dt/2)
+        
+        G = minf * 4. + self.w * 8. + 2.
+        E = minf * 4. * 120. + self.w * 8. * -84. + 2. * -60.
+        inp = self.Iapp + z
+        inp = inp * 36.75 + 39.9 # This makes HH and ML range of inputs consistent.
+        inp = inp / self.C
+        G, E = G / self.C, E / self.C
+        self.V = (self.V * (1 - self.dt/2 * G) + self.dt * (E + inp)) / (1 + self.dt/2 * G)
+        self.T = torch.sigmoid((self.V - self.Vt) / self.Kp)
+        return self.T
+    
 class VanillaBNN(StatefulBase):
     ''' Implements a network of biological (or spiking) neurons with a specified neuron model type. '''
     def __init__(self, net_params, device = 'cpu'):
@@ -124,7 +230,8 @@ class VanillaBNN(StatefulBase):
             spike_grad = surrogate.fast_sigmoid(slope=25)
             self.hidden_neurons = snn.Leaky(beta=net_params['snn_beta'], spike_grad=spike_grad)
         else:
-            self.hidden_neurons = HH(self.n_hidden, device)
+            self.hidden_neurons = MorrisLecar(self.n_hidden, device, phi = 2./30.0, V3 = 12., V4 = 17.)
+            # self.hidden_neurons = HH_Fast(self.n_hidden, device)
 
         self.reset_state()
         self.trunc = net_params.get('trunc', -1) # Truncation for TBTT.
@@ -200,15 +307,15 @@ class VanillaBNN(StatefulBase):
                 spk_out[:, time_idx, :] = self(x, time_idx)
                                 
         self.counter = self.__dict__.get("counter", -1) + 1
-        if self.counter % 5 == 0:
+        if self.counter % 10 == 0:
             plt.subplot(2,1,1)
-            plt.plot(self.z1[0, :, 0].detach().cpu())
+            plt.plot(self.z1[0, :, :3].detach().cpu())
             plt.subplot(2,1,2)
             plt.plot(spk_out[0, :, :].detach().cpu())
             plt.show()
             
             if self.hist is not None and len(self.hist['train_loss']) > 0:
-                plt.plot(self.hist['train_loss'])
+                plot_accuracy(self.hist)
                 plt.show()
 
         filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)

@@ -77,11 +77,26 @@ def plot_accuracy(hist):
     ax1.set_ylabel('Accuracy')
     ax1.legend()
     plt.show()
+    
+def plot_lr_decay(hist):
+    plt.figure()
+    plt.plot(hist['iters_monitor'], hist['lr'], color=c_vals[0])
+    plt.yscale('log')
+    plt.show()
 
 def eval_on_test_set(net, testData):
-    labels = np.array(testData[:,:,:][1][:, -1, 0].cpu())
     db = net.evaluate(testData[:,:,:], debug=True)
     return db
+
+def to_dataset(data, labels, device='cuda'):
+    ''' Convert data and labels in numpy format to tensorDataset.'''
+    from torch.utils.data import TensorDataset
+    # Make labels same shape as data: [B] -> [B, T, 1].
+    labels_full = labels.reshape(-1, 1, 1) # [Batch size, 1, 1]
+    labels_full = labels_full.repeat(data.shape[1], 1) # [Batch Size, Tsteps, 1]
+    data, labels_full = torch.from_numpy(data), torch.from_numpy(labels_full)
+    data, labels_full = data.to(device), labels_full.to(device)
+    return TensorDataset(data, labels_full)
 
 def sliding_window_states(len_filter, states):
     from scipy.signal import fftconvolve
@@ -119,8 +134,31 @@ def PCA_dim(states, verbose = False):
         print('PR: {:.2f}'.format(PR))
     return PR, pca, pca_handler
 
-def plot_pca(hs_pca, labels):
+def plot_pca(hs_pca, labels, zero_mat_pca = None):
     color_type = 'labels' # 'labels', 'words', 'seq_idx', 'labels_1', 'labels_2'
+    
+    spread = np.zeros((3, hs_pca.shape[1]))
+    plt.figure(dpi=500)
+    for i in range(3):
+        spread[i] = np.var(hs_pca[:, :, i], 0)
+        plt.plot(spread[i], color=c_vals[i], label=str(i))
+    plt.legend()
+    plt.xlabel('Timestep')
+    plt.ylabel('Variance Along PCA Dimension')
+    plt.show()
+    
+    masks = [labels == 0, labels == 1, labels == 2]
+    clusters = [np.mean(hs_pca[np.where(mask), :, :][0], 0) for mask in masks]
+    plt.figure(figsize=(16,4))
+    for d in range(3):
+        plt.subplot(1,3,d+1)
+        for i in range(len(masks)):
+            plt.plot(clusters[i][:, d], c=c_vals[i])
+        plt.xlabel('Timestep')
+        plt.ylabel('Cluster Mean')
+        plt.title(f'PC{d}')
+    plt.tight_layout()
+    plt.show()
     
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16,4))
     
@@ -128,27 +166,28 @@ def plot_pca(hs_pca, labels):
     pcys = (1, 2, 2)
     ax_pair_lims = (None, None, None)
     
-    cmap = plt.cm.get_cmap('plasma')
-    # phrase_len = hs_fit.shape[1]
-    
     for ax, pcx, pcy, ax_pair_lim in zip((ax1, ax2, ax3), pcxs, pcys, ax_pair_lims):
+        n_per_label = [0, 0, 0]
         for batch_idx in range(labels.shape[0]):
             if color_type == 'labels':
                 color_labels_l = c_vals_l[labels[batch_idx]]
                 color_labels = c_vals[labels[batch_idx]]
     
             ax.scatter(hs_pca[batch_idx, :, pcx], hs_pca[batch_idx, :, pcy], linewidth=0.0,
-                       marker='o', color=color_labels_l, zorder=0, alpha=0.5)
-            ax.scatter(hs_pca[batch_idx, -1, pcx], hs_pca[batch_idx, -1, pcy], marker='o',
+                        marker='.', color=color_labels_l, zorder=0, alpha=0.5)
+            n_per_label[labels[batch_idx]] += 1
+            ax.scatter(hs_pca[batch_idx, -1, pcx], hs_pca[batch_idx, -1, pcy], marker='.',
                        color=color_labels, zorder=5, alpha=0.5)
     
-        # for ro_idx in range(net_params['n_outputs']):
-        #     ax.plot([zero_matrix_pca[ro_idx, pcx], ro_matrix_pca[ro_idx, pcx]], 
-        #             [zero_matrix_pca[ro_idx, pcy], ro_matrix_pca[ro_idx, pcy]],
-        #              color=c_vals_d[ro_idx], linewidth=3.0, zorder=10)
+        # Plot coordinate axes for PCA.
+        if zero_mat_pca is not None:
+            for ro_idx in range(zero_mat_pca.shape[0]):
+                ax.plot([zero_mat_pca[ro_idx, pcx], zero_mat_pca[ro_idx, pcx]], 
+                        [zero_mat_pca[ro_idx, pcy], zero_mat_pca[ro_idx, pcy]],
+                          color=c_vals_d[ro_idx], linewidth=3.0, zorder=10)
     
         # Some sample paths
-        for batch_idx in range(3):
+        for batch_idx in range(0):
             ax.plot(hs_pca[batch_idx, :, pcx], hs_pca[batch_idx, :, pcy], marker='.',
                     color=c_vals_d[labels[batch_idx]], zorder=5)
     
@@ -166,3 +205,60 @@ def plot_pca(hs_pca, labels):
     elif color_type == 'seq_idx':
         ax2.set_title('Hidden state PC plots (color by sequence location)')
     plt.show()
+
+def input_vector_to_words(sample, word_list):
+    ''' Convert an input which is of size [tsteps, input size] to a word 
+    consisting of indices corresponding to a dictionary of words (shape [tsteps]). '''
+    
+    # Measure which word in the word_list (vectors) has minimal distance for each timstep.
+    dists = word_list.reshape(word_list.shape[0], 1, -1) - sample.reshape(1, *sample.shape)
+    dists = np.linalg.norm(dists, axis=2) # Shape [# words, tsteps].
+    return np.argmin(dists, axis=0) # Shape [tsteps].
+
+def get_percents_sample(evid_vec, n_labels):
+    ''' Get percent of sample that corresponds to each label (not including null/eos/etc).
+    Sample should be an array of shape [tsteps] with indices corresponding to words. '''
+    sums = np.zeros(n_labels)
+    for l in range(n_labels):
+        sums[l] = np.sum(evid_vec == l) 
+    return sums / np.sum(sums)
+
+def get_extreme_data(data, labels, toy_params, above_thresh = 0.0, below_thresh = 1.0, debug=False):
+    ''' Determine which data samples are 'extreme', 
+    in the sense that there is a lot or very little evidence for correct label. 
+    Will check the percent of label in each sample and select ones above 
+    above_thresh and below below_thresh.'''
+    words = np.array([toy_params['word_to_input_vector'][word] for word in toy_params['words']])
+    percent_label = np.zeros(data.shape[0]) # Percent of input that corresponds to label.
+    for i in range(data.shape[0]):
+        # Convert input sample from string of random binary vectors to indices for evidence.
+        label, sample = labels[i], data[i] # sample is shape [T, word len].
+        evid_vec = input_vector_to_words(sample, words)
+        percent_label[i] = get_percents_sample(evid_vec, toy_params['n_classes'])[label]
+        
+    if debug:
+        plt.figure()
+        plt.hist(percent_label, bins = 30, zorder=5)
+        if above_thresh > 0:
+            plt.axvline(above_thresh, color='red', zorder=10)
+        if below_thresh < 1:
+            plt.axvline(below_thresh, color='red', zorder=10)
+        plt.show()
+        
+    matches = np.logical_and(percent_label > above_thresh, percent_label < below_thresh)
+    return np.where(matches)
+
+def cutoff_data(data, labels, toy_params, cutoff_ts = -1):
+    ''' Cutoff samples so that at and after cutoff_ts all the input is just null (except for EOS).'''
+    words = np.array([toy_params['word_to_input_vector'][word] for word in toy_params['words']])
+    null_vec = toy_params['word_to_input_vector']['null']
+    for i in range(data.shape[0]):
+        sample = data[i]
+        sample[cutoff_ts:-1] = null_vec
+        
+        # Relabel based on new input sample.
+        evid_vec = input_vector_to_words(sample, words)
+        percents = get_percents_sample(evid_vec, toy_params['n_classes'])
+        labels[i] = np.argmax(percents)
+    return data, labels
+        

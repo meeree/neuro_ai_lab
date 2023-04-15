@@ -10,7 +10,7 @@ import sys
 sys.path.append('../../mpn') # Replace with your own relative path.
 import int_data as syn
 from networks import VanillaBNN
-from utils import fit, eval_on_test_set, sliding_window_states, PCA_dim, plot_pca, plot_accuracy, c_vals
+from utils import fit, to_dataset, cutoff_data, get_extreme_data, eval_on_test_set, sliding_window_states, plot_lr_decay, PCA_dim, plot_pca, plot_accuracy, c_vals
 from matplotlib import pyplot as plt
 import os
 from tqdm import tqdm
@@ -194,11 +194,9 @@ def single_window_plot():
 #     plt.plot(timeframes, grid[:, 0])
 #     plt.show()
 
-def hh_properties_test():
+def neural_properties_test(hh):
     ''' Test hodgkin-huxley model with different inputs, etc. '''
-    from networks import HH
-    hh = HH(1, 'cpu')
-    hh.reset_state(1)
+    hh.reset_state(1, False)
     # hh.gk = 0 
     # I_{Na,t} model with oscillation (pg. 133 of Izhikevich DSN)
     # hh.gk = 0.0
@@ -210,11 +208,11 @@ def hh_properties_test():
     # hh.gl = 1.5
     # hh.gna = 15.0
     
-    
     z = torch.zeros((1, 1))
     V_out = torch.zeros(2000)
-    hh.Iapp = 0.5
+    hh.Iapp = 1.0
     K_out = torch.zeros((2000, 3))
+    T_out = torch.zeros(2000)
     for i in range(2000):
         # hh.Iapp = np.sin(i / 2000.0 * 2 * np.pi * 10) * 1.5
         # if i > 700 or i > 1000:
@@ -222,19 +220,22 @@ def hh_properties_test():
         # if (i > 720 and i < 1000) or i > 1020:
         #     hh.Iapp = 0.0
         z = torch.ones((1, 1)) * 0
-        V_out[i] = hh.V.item()
-        K_out[i, :] = hh.K[:, 0, 0].detach()
+        # K_out[i, :] = hh.K[:, 0, 0].detach()
         _ = hh(z)
+        V_out[i] = hh.V.item()
+        T_out[i] = hh.T.item()
         
-    plt.plot(V_out, K_out[:, 1])
-    plt.show()
+    # plt.plot(V_out, K_out[:, 1])
+    # plt.show()
     
     plt.plot(V_out, c='black')
     ax2 = plt.gca().twinx()
-    # ax2.plot(K_out)
+    ax2.plot(T_out)
     plt.show()
-    
-# hh_properties_test()
+
+# from networks import HH, HH_Fast, MorrisLecar
+# hh =  MorrisLecar(1, 'cpu', phi = 2./30.0, V3 = 12., V4 = 17.)
+# neural_properties_test(hh)
 # exit()
 
 def get_fit_lif(I0, freq, fudge = 0.99, debug = False):
@@ -326,13 +327,13 @@ def fit_lif_hh_fi_curve(T=5000):
     return max_I0, max_freq, best_fudge
     
 # print(fit_lif_hh_fi_curve())
-# exit()
 
 def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     global toy_params
     global trainData, validData, trainOutputMask, validOutputMask
     import json
     torch.cuda.set_device(1) # SPECIFY CUDA DEVICE TO USE
+
         
     def plot(net):          
         for i, W in enumerate([net.W_inp, net.W_rec, net.W_ro]):
@@ -344,23 +345,25 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
       
     toy_params['phrase_length'] = 50
     net_params['filter_length'] = 50
+    net_params['random_start'] = 750
     net_params['cuda'] = True
     net_params['use_snn'] = False
     net_params['n_per_step'] = 40
-    net_params['loss_fn'] = 'mse'
-    train_params['lr'] = 5e-3
-    train_params['batch_size'] *= 2
-    # net_params['random_start'] = 500
+    # net_params['loss_fn'] = 'mse'
+    train_params['lr'] = 5e-4
+    train_params['batch_size'] *= 4
     train_params['scheduler'] = 'reducePlateau'
     
     # SNN setup
     # net_params['filter_length'] = 20
-    # net_params['cuda'] = False
+    # net_params['cuda'] = False 
     # net_params['use_snn'] = True
     # net_params['n_per_step'] = 20
     # train_params['lr'] = 1e-3
     
     net = VanillaBNN(net_params, device='cuda').to('cuda')
+    net.W_ro.weight.data.fill_(1.0) # Custom initialization
+    net.W_ro.bias.data.fill_(0.0)
     # for name, param in net.named_parameters():
     #     param.data *= 5
     
@@ -386,9 +389,11 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
         import glob
         fl_names = [os.path.basename(fl) for fl in glob.glob(folder_full + '/save_*.pt')]
         fl_names.sort(key = lambda fl: int(fl[5:-3]))
+        fl_names = fl_names[:100]
         sd = torch.load(folder_full + '/' + fl_names[-1])
         hist = sd['hist']
         plot_accuracy(hist)
+        plot_lr_decay(hist)
         
         if specific_epoch >= 0:
             net_idx = specific_epoch
@@ -411,7 +416,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
             verbose=False, auto_balance=False, device=device)
             
-        net = fit(net, 'TRAIN_5e-3_MSE_LOSS_PLATEAU0.5', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
+        net = fit(net, folder, toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
         
     # Swap out LIF model instead of HH.
     # net.use_snn = True
@@ -422,13 +427,23 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             test_set_size, toy_params, net_params['n_outputs'], 
             verbose=False, auto_balance=False, device='cuda')
     
-    labels = np.array(testData[:,:,:][1][:, -1, 0].cpu())
+
+    labels = np.array(testData[:,:,:][1][:, -1, 0].cpu())    
+    test_inputs = testData[:, :, :][0].cpu().numpy()
     db = eval_on_test_set(net, testData)
     accuracy = net.accuracy(testData[:,:,:], outputMask=testOutputMask)
     print('Accuracy: ', accuracy.item())
     spk_hidden = db['spk_hidden'].detach().cpu().numpy()
     spk_out = db['spk_out'].detach().cpu().numpy()
-    spk_out = spk_out[:, 10:, :]
+    
+    W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
+    W_ro = net.W_ro.weight.data.clone().cpu().detach().numpy()
+    W_inp = net.W_inp.weight.data.clone().cpu().detach().numpy()
+    
+    for fl, arr in zip(['spk_hidden.pt', 'spk_out.pt', 'labels_out.pt', 'W_ro.pt'], [spk_hidden, spk_out, labels, W_ro]):
+        print(fl)
+        with open(fl, 'wb') as f:
+            np.save(f, arr)
     
     def svd_analysis():
         W_ro = net.W_ro.weight.data.detach().cpu().numpy()
@@ -453,12 +468,11 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
         plt.show()
     svd_analysis()
     
-    W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
-    W_ro = net.W_ro.weight.data.clone().cpu().detach().numpy()
-    W_inp = net.W_inp.weight.data.clone().cpu().detach().numpy()
-    
-    print(np.linalg.norm(W_rec - init_W_rec) / np.linalg.norm(init_W_rec), np.linalg.norm(W_ro - init_W_ro) / np.linalg.norm(init_W_ro), np.linalg.norm(W_inp - init_W_inp) / np.linalg.norm(init_W_inp))
-    
+    diff_rec = np.linalg.norm(W_rec - init_W_rec) / np.linalg.norm(init_W_rec)
+    diff_ro = np.linalg.norm(W_ro - init_W_ro) / np.linalg.norm(init_W_ro)
+    diff_inp = np.linalg.norm(W_inp - init_W_inp) / np.linalg.norm(init_W_inp)
+    print(f'Relative weight change: W_rec {diff_rec:.2f}, W_ro {diff_ro:.2f}, W_inp {diff_inp:.2f}')
+        
     means_out = np.zeros((3, spk_out.shape[1], 3))
     n_hit = np.zeros(3)
     for i in range(len(labels)):
@@ -470,6 +484,11 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     # Plot output weights
     plt.figure(dpi=300)
     plt.imshow(net.W_ro.weight.data.detach().cpu() > 0, aspect='auto')
+    plt.show()
+
+    for i in range(3):
+        plt.subplot(3, 1, 1+i)
+        plt.specgram(means_out[0, :, i], cmap="seismic")
     plt.show()
 
     animate_phase = False
@@ -520,10 +539,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
                         
         for j in range(3):  
             trace = means_out[i, :, j]
-            running_sum = np.zeros(net.filter_len)
-            for k in range(-net.filter_len+1,0):
-                running_sum[k+net.filter_len] = running_sum[k - 1] + trace[k]
-            running_sum /= net.filter_len
+            running_sum = np.cumsum(trace[-net.filter_len:]) / net.filter_len
             plt.subplot(3,3,3*i+2)
             plt.plot(running_sum, c = c_vals[j], linestyle = '--' if j != i else '-')
             
@@ -558,15 +574,102 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     plt.ylabel('Imaginary')
     plt.title('Eigenvalues')
     plt.show()
-   
-    spk_hidden = net.z1.detach().cpu().numpy()
-    hidden_conv = sliding_window_states(net.filter_len, spk_hidden)
-    PR, hs_pca, pca_handler = PCA_dim(hidden_conv)
-    print('PCA Dimensionality Estimate', PR)
-    plot_pca(hs_pca, labels = np.array(testData[:,:,:][1][:, -1, 0].cpu()))
     
-analyze_network_discrete('', True)
-analyze_network_discrete('TRAIN_5e-3_SHORT_50ts', False)
+    windows = np.linspace(220, 220, 1).astype(int)
+    prs = []
+    for w in tqdm(windows):
+        hidden_conv = sliding_window_states(w, spk_hidden)
+        prs.append(PCA_dim(hidden_conv)[0])
+    plt.plot(windows, prs)
+    plt.xlabel('Window Size')
+    plt.ylabel('Estimated PCA Dimensionality')
+    plt.show()
+    
+    min_w, _ = min(zip(windows, prs), key=lambda wp: wp[1])
+         
+    # TODO: ISOLATE PCA ON EXTREME CASES. ALSO TURN OFF NOISE!
+    # TODO: WHAT IF WE REMOVE SOME TRANSIENT TIME?? no change :(
+    
+    # Isolate extreme cases in data
+    # percents = np.linspace(0.0, 1.0, 0, endpoint=False)
+    # prs = []
+    # for percent in tqdm(percents):
+    #     inds = get_extreme_data(test_inputs, labels, toy_params, 
+    #                             percent, debug=True)
+    #     spk_hidden, labels, test_inputs = spk_hidden[inds], labels[inds], test_inputs[inds]
+    #     hidden_conv = sliding_window_states(min_w, spk_hidden)
+    #     prs.append(PCA_dim(hidden_conv)[0])
+        
+    # plt.figure()
+    # plt.plot(percents, prs)
+    # plt.xlabel('Extremeness Percent Cutoff')
+    # plt.ylabel('Estimated PCA Dimensionality')
+    # plt.show()
+    
+    # Analyze PCA. We use more test data here. 
+    # This requires iterated evaluates since the data is too big for the GPU in one pass.
+    spk_hidden_total = np.zeros((10, *spk_hidden.shape))
+    test_inputs_total = np.zeros((10, *test_inputs.shape))
+    labels_total = np.zeros((10, *labels.shape)).astype(int)
+       
+    for cutoff in [toy_params['phrase_length']]:
+        accuracy = 0.0
+        for i in tqdm(range(10)):
+            testData, testOutputMask, _ = syn.generate_data(
+                test_set_size, toy_params, net_params['n_outputs'], 
+                verbose=False, auto_balance=False, device='cuda')
+            test_inputs, labels = testData[:, :, :][0].cpu().numpy(), testData[:, :, :][1][:, -1, 0].cpu().numpy()  
+         
+            test_inputs, labels = cutoff_data(test_inputs, labels, toy_params, cutoff)
+            testData = to_dataset(test_inputs, labels)
+            test_inputs_total[i], labels_total[i] = test_inputs, labels
+            
+            db = eval_on_test_set(net, testData)
+            accuracy += net.accuracy(testData[:,:,:], outputMask=testOutputMask) / 10
+            spk_hidden_total[i] = db['spk_hidden'].detach().cpu().numpy()
+        print('Accuracy: ', accuracy.item(), 'Cutoff: ', cutoff)
+          
+        spk_hidden = spk_hidden_total.reshape((-1, *spk_hidden.shape[1:]))
+        labels = labels_total.reshape(-1)
+        test_inputs = test_inputs_total.reshape((-1, *test_inputs.shape[1:]))
+        hidden_conv = sliding_window_states(min_w, spk_hidden)
+                
+        # Plot hidden states with imshow
+        for spks in [spk_hidden, hidden_conv]:
+            plt.figure(dpi=600)
+            n_per_label = [0, 0, 0]
+            vmin, vmax = np.min(spks), np.max(spks)
+            for i in range(spk_hidden.shape[0]):
+                label = labels[i]
+                if n_per_label[label] < 5:
+                    plt.subplot(5, 3, n_per_label[label] * 3 + label + 1)
+                    plt.imshow(spks[i, :, :].T, vmin=vmin, vmax = vmax, aspect='auto', cmap='seismic')
+                    n_per_label[label] += 1
+            plt.show()
+                
+        # PCA analysis
+        PR, hs_pca, pca_handler = PCA_dim(hidden_conv)
+        print('Window size', min_w, 'PCA Dimensionality Estimate', PR)
+        with open('pca.npy', 'wb') as f:
+            np.save(f, hs_pca)
+            
+        with open('labels.npy', 'wb') as f:
+            np.save(f, labels)
+    
+        zero_mat_pca = pca_handler.transform(np.zeros_like(W_ro))    
+        plot_pca(hs_pca, labels, zero_mat_pca)
+ 
+# analyze_network_discrete('CONTINUE_TWICE_SCHEDULE', False)
+analyze_network_discrete('MORRIS_LECAR_FIT_5e-4_RANDOM_LENGTH_CONTINUE_1e-4_BSIZE_4', False)
+# analyze_network_discrete('HH_FAST_FIT_5e-4_RANDOM_LENGTH', True)
+exit()
+analyze_network_discrete('MORRIS_LECAR_FIT_5e-4_CONTINUE_5e-5', False)
+analyze_network_discrete('CONTINUE_FAST_HH', False)
+
+# analyze_network_discrete('SNN_5e-4_MSE_LOSS_PLATEAU0.5', False)
+analyze_network_discrete('CONTINUE_TWICE_SCHEDULE', False)
+# analyze_network_discrete('TRAIN_5e-3_MSE_LOSS_PLATEAU0.5', False)
+# analyze_network_discrete('TRAIN_5e-4_MSE_LOSS_PLATEAU0.5', False)
 exit()
 
 analyze_network_discrete('TRAIN_5e-3_PLATEAU_SCHEDULE0.5/', False)
