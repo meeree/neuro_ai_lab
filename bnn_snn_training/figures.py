@@ -210,7 +210,7 @@ def neural_properties_test(hh):
     
     z = torch.zeros((1, 1))
     V_out = torch.zeros(2000)
-    hh.Iapp = 1.0
+    hh.Iapp = 0.0
     K_out = torch.zeros((2000, 3))
     T_out = torch.zeros(2000)
     for i in range(2000):
@@ -232,10 +232,49 @@ def neural_properties_test(hh):
     ax2 = plt.gca().twinx()
     ax2.plot(T_out)
     plt.show()
+    
 
 # from networks import HH, HH_Fast, MorrisLecar
 # hh =  MorrisLecar(1, 'cpu', phi = 2./30.0, V3 = 12., V4 = 17.)
+# hh = HH_Fast(1, 'cpu')
 # neural_properties_test(hh)
+# exit()
+
+def network_properties_test():
+    from networks import VanillaBNN
+    net_params['softmax'] = False
+    net_params['noise_std'] = 0.0
+    net_params['n_hidden'] = 128
+    net = VanillaBNN(net_params, device='cuda').to('cuda')
+    net.hidden_neurons.Iapp = 0.1
+    
+    # Initialize all weights to 1 and all biases to 0 
+    for W in[net.W_ro, net.W_rec, net.W_inp]:
+        W.weight.data.fill_(1e-1)
+        W.bias.data.fill_(0.0)
+        
+    net.W_rec.weight.data.fill_(1e-3)
+    
+    # sparse = torch.rand(net.W_rec.weight.shape)
+    # sparse = torch.where(sparse > 0.7, 1.0, 0.0)
+    # net.W_rec.weight.data = sparse.cuda()
+
+    tsteps = 4000
+    inp = torch.ones((1, tsteps, net.n_inputs)).cuda() * 0
+    batch = (inp, inp)
+    out = net.evaluate(batch).detach().cpu().numpy()[0]
+    
+    raster = net.z1.detach().cpu().numpy()[0]
+    raster = raster > -20
+    plt.figure(dpi=500)
+    plt.imshow(raster.T, aspect = 'auto', cmap = 'binary')
+    plt.show()
+    
+    plt.figure()
+    plt.plot(out[:, 0])
+    plt.show()
+    
+# network_properties_test()
 # exit()
 
 def get_fit_lif(I0, freq, fudge = 0.99, debug = False):
@@ -328,68 +367,18 @@ def fit_lif_hh_fi_curve(T=5000):
     
 # print(fit_lif_hh_fi_curve())
 
-def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
-    global toy_params
-    global trainData, validData, trainOutputMask, validOutputMask
-    import json
-    torch.cuda.set_device(1) # SPECIFY CUDA DEVICE TO USE
-
+def load_network(net, toy_params, folder_full, specific_epoch = -1):
+    import json, glob
+    with open(folder_full + '/toy_params.json') as f:
+        toy_params = json.load(f)    
+        for key, val in toy_params.get('base_word_vals', {}).items():
+            toy_params['base_word_vals'][key] = np.array(val)
+        for key, val in toy_params.get('word_to_input_vector', {}).items():
+            toy_params['word_to_input_vector'][key] = np.array(val)
         
-    def plot(net):          
-        for i, W in enumerate([net.W_inp, net.W_rec, net.W_ro]):
-            plt.subplot(1,3,1+i)
-            plt.imshow(W.weight.data.cpu(), aspect='auto', interpolation='none', cmap='seismic')
-            plt.xticks([])
-            plt.yticks([])
-        plt.show()
-      
-    toy_params['phrase_length'] = 50
-    net_params['filter_length'] = 50
-    net_params['random_start'] = 750
-    net_params['cuda'] = True
-    net_params['use_snn'] = False
-    net_params['n_per_step'] = 40
-    # net_params['loss_fn'] = 'mse'
-    train_params['lr'] = 5e-4
-    train_params['batch_size'] *= 4
-    train_params['scheduler'] = 'reducePlateau'
-    
-    # SNN setup
-    # net_params['filter_length'] = 20
-    # net_params['cuda'] = False 
-    # net_params['use_snn'] = True
-    # net_params['n_per_step'] = 20
-    # train_params['lr'] = 1e-3
-    
-    net = VanillaBNN(net_params, device='cuda').to('cuda')
-    net.W_ro.weight.data.fill_(1.0) # Custom initialization
-    net.W_ro.bias.data.fill_(0.0)
-    # for name, param in net.named_parameters():
-    #     param.data *= 5
-    
-    lif_10x_slower = get_fit_lif(0.05005, 0.1 / 134.6717, 0.999) 
-    # net.hidden_neurons = lif_10x_slower
-    
-    # net.trunc = 10
-    init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
-    init_W_ro = net.W_ro.weight.data.clone().cpu().detach().numpy()
-    init_W_inp = net.W_inp.weight.data.clone().cpu().detach().numpy()
-    
-    folder_full = 'SAVES/' + folder
-    if len(folder) > 0 and os.path.exists(folder_full):
-        # Load folder of saved data and find best or specific epoch for network to load.
-        with open(folder_full + '/toy_params.json') as f:
-            toy_params = json.load(f)    
-            for key, val in toy_params.get('base_word_vals', {}).items():
-                toy_params['base_word_vals'][key] = np.array(val)
-            for key, val in toy_params.get('word_to_input_vector', {}).items():
-                toy_params['word_to_input_vector'][key] = np.array(val)
-    
         # Get index of best network and load it
-        import glob
         fl_names = [os.path.basename(fl) for fl in glob.glob(folder_full + '/save_*.pt')]
         fl_names.sort(key = lambda fl: int(fl[5:-3]))
-        fl_names = fl_names[:100]
         sd = torch.load(folder_full + '/' + fl_names[-1])
         hist = sd['hist']
         plot_accuracy(hist)
@@ -405,6 +394,209 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
         sd.pop('hist')
         net.load_state_dict(sd)
         net = net.to('cuda')
+        
+    return net, toy_params
+       
+def ablation_testing(folder = ''):
+    global toy_params
+    global trainData, validData, trainOutputMask, validOutputMask
+    import utils
+
+    folder_full = 'SAVES/' + folder    
+    if not os.path.exists(folder_full):
+        print(f"Folder doesn't exist: {folder_full}")
+        return
+
+    toy_params['phrase_length'] = 50
+    net_params['filter_length'] = 100
+    net_params['cuda'] = True
+    net_params['use_snn'] = False
+    net_params['n_per_step'] = 40
+    toy_params['n_classes'] = 3
+    net_params['n_outputs'] = toy_params['n_classes']
+    net_params['softmax'] = True
+    
+    net = VanillaBNN(net_params, device='cuda').to('cuda')
+    net.hidden_neurons.Iapp = 0.1
+        
+    net, toy_params = load_network(net, toy_params, folder_full)
+    net.toy_params = toy_params
+    
+    # Evaluation and analysis of model.
+    torch.manual_seed(0)
+    test_set_size = 10
+    testData, testOutputMask, _ = syn.generate_data(
+            test_set_size, toy_params, net_params['n_outputs'], 
+            verbose=False, auto_balance=False, device='cuda')
+    
+    labels = np.array(testData[:,:,:][1][:, -1, 0].cpu())    
+    test_inputs = testData[:, :, :][0].cpu().numpy()
+    
+    evid0 = toy_params['word_to_input_vector']['evid0']
+    null = toy_params['word_to_input_vector']['null']
+    print(test_inputs.shape, evid0.shape)
+    
+    test_inputs[:, :-1, :] = null # Fill with no evidence
+    cutoffs = np.linspace(0, test_inputs.shape[1], test_set_size+1)
+    cutoffs = cutoffs[1:].astype(int)
+    
+    for i in range(test_set_size-1):
+        # test_inputs[i, :cutoffs[i], :] = evid0
+        test_inputs[i, cutoffs[i]:cutoffs[i+1]] = evid0
+    
+    labels.fill(0)
+    testData = to_dataset(test_inputs, labels)
+    
+    word_grid = []
+    for inp, label in zip(test_inputs, labels):
+        word_grid.append(utils.input_vector_to_words(inp, toy_params))
+    plt.imshow(word_grid, cmap = 'gist_rainbow', aspect='auto', interpolation='none')
+    cbar = plt.colorbar(ticks=[0,1,2,3,4])
+    cbar.ax.set_yticklabels(toy_params['words'])
+    plt.show()
+
+    db = eval_on_test_set(net, testData)
+    accuracy = net.accuracy(testData[:,:,:], outputMask=testOutputMask)
+    print('Accuracy: ', accuracy.item())
+    spk_hidden = db['spk_hidden'].detach().cpu().numpy()
+    spk_out = db['spk_out'].detach().cpu().numpy()
+    
+    out_conv = np.sum(spk_out[:, -net.filter_len:], 1)
+    predicted = np.array(np.argmax(out_conv, 1))
+        
+    for case in range(test_set_size):
+        for n_back in [40]:
+            plt.figure(dpi=600)
+            plt.subplot(3,1,1)
+            scaled_back = net_params['n_per_step'] * n_back
+            plt.plot(spk_out[case, -scaled_back:, :])
+            plt.title(f'Cutoff = {cutoffs[case]}, label = {labels[0]}, predicted = {predicted[0]}')
+            plt.legend([0,1,2])
+            
+            plt.subplot(3,1,2)
+            weights = net.W_ro.weight[0, :].detach().cpu().numpy()
+            plt.imshow(spk_hidden[case, -scaled_back:, :].T * weights.reshape(-1, 1), aspect='auto', cmap='seismic')
+            plt.colorbar()
+            
+            plt.subplot(3,1,3)
+            plt.plot(word_grid[case][-n_back:])
+            plt.yticks([0, 1, 2, 3, 4], toy_params['words'])
+            plt.show()        
+
+# ablation_testing('TEST_50ev_NO_RANDOM_5e-4_CORRECT_LR')
+# exit()
+
+def gru_test():
+    from networks import VanillaGRU
+    global toy_params
+    global trainData, validData, trainOutputMask, validOutputMask
+
+    toy_params['phrase_length'] = 5
+    train_params['epochs'] = 10
+    net_params['filter_length'] = 100
+    # net_params['random_start'] = 10
+    net_params['cuda'] = True
+    net_params['n_per_step'] = 30
+    toy_params['n_classes'] = 3
+    net_params['n_outputs'] = toy_params['n_classes']
+    train_params['lr'] = 5e-4
+    train_params['batch_size'] = 150
+    # net_params['softmax'] = True
+    device = 'cuda' if net_params['cuda'] else 'cpu' 
+    
+    net = VanillaGRU(net_params, device=device).to(device)
+    
+    trainData, trainOutputMask, toy_params = syn.generate_data(
+        train_params['train_set_size'], toy_params, net_params['n_outputs'], 
+        verbose=True, auto_balance=False, device=device)
+    
+    validData, validOutputMask, _ = syn.generate_data(
+        train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
+        verbose=False, auto_balance=False, device=device)
+        
+    net = fit(net, 'GRU_TEST', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=True) 
+    plot_accuracy(net.hist)
+    
+    out = net.out.cpu().detach()
+    for b in range(out.shape[0]):
+        plt.plot(out[b])
+        plt.show()
+        
+# gru_test()
+# exit()
+        
+def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
+    global toy_params
+    global trainData, validData, trainOutputMask, validOutputMask
+    import json
+        
+    def plot(net):          
+        for i, W in enumerate([net.W_inp, net.W_rec, net.W_ro]):
+            plt.subplot(1,3,1+i)
+            plt.imshow(W.weight.data.cpu(), aspect='auto', interpolation='none', cmap='seismic')
+            plt.xticks([])
+            plt.yticks([])
+        plt.show()
+
+    # TODO: SET TRUNC, DELAY, ETC FOR LONG TIME FRAME TASK        
+    toy_params['phrase_length'] = 50
+    net_params['filter_length'] = 100
+    # net_params['random_start'] = 10
+    net_params['cuda'] = True
+    net_params['use_snn'] = False
+    net_params['n_per_step'] = 40
+    toy_params['n_classes'] = 3
+    net_params['n_outputs'] = toy_params['n_classes']
+    net_params['loss_fn'] = 'mse'
+    train_params['lr'] = 5e-4
+    train_params['batch_size'] = 150
+    # train_params['scheduler'] = 'reducePlateau'
+    net_params['softmax'] = True
+    # net_params['n_hidden'] = 256
+    
+    # SNN setup
+    # net_params['filter_length'] = 20
+    # net_params['cuda'] = False 
+    # net_params['use_snn'] = True                print(end)
+
+    # net_params['n_per_step'] = 20
+    # train_params['lr'] = 1e-3
+    
+    net = VanillaBNN(net_params, device='cuda').to('cuda')
+    
+    for param in net.params:
+        param.set_params(100, 0.1)
+        
+    for W in[net.W_ro, net.W_rec, net.W_inp]:
+        W.weight.data.fill_(1e-1)
+        # W.bias.data.fill_(0.0)
+        
+        stdv = 1. / (W.weight.size(1) ** 0.5)
+        # W.weight.data.uniform_(-stdv + 1e-1, stdv + 1e-1)
+        # W.bias.data.uniform_(-stdv, stdv)
+        
+    stdv = 1. / (net.W_rec.weight.size(1) ** 0.5)   
+    net.W_rec.weight.data.fill_(1e-3)
+    net.hidden_neurons.Iapp = 0.1
+    # net.W_rec.weight.data.uniform_(1e-3 - stdv, 1e-3 + stdv)
+    
+    override = False
+    
+    # net.trunc = 10
+    init_W_rec = net.W_rec.weight.data.clone().cpu().detach().numpy()
+    init_W_ro = net.W_ro.weight.data.clone().cpu().detach().numpy()
+    init_W_inp = net.W_inp.weight.data.clone().cpu().detach().numpy()
+    
+    folder_full = 'SAVES/' + folder
+    # for name, param in net.named_arameters():
+    #     param.data *= 5
+    
+    # lif_10x_slower = get_fit_lif(0.05005, 0.1 / 134.6717, 0.999) 
+    # net.hidden_neurons = lif_10x_slower
+    if not override and len(folder) > 0 and os.path.exists(folder_full):
+        net, toy_params = load_network(net, toy_params, folder_full)
+        
+    net.toy_params = toy_params
 
     if train:
         # Regenerate the train/validation sets and train. 
@@ -416,8 +608,8 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
             verbose=False, auto_balance=False, device=device)
             
-        net = fit(net, folder, toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=False) 
-        
+        net = fit(net, 'SMOOTHGRAD_TESTS', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=True) 
+        #'TEST_50ev_NO_RANDOM_5e-4_CORRECT_LR'
     # Swap out LIF model instead of HH.
     # net.use_snn = True
     # net.hidden_neurons = get_fit_lif(2.0, 0.0038, 0.05) # Use parameters to fit LIF to HH
@@ -428,7 +620,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             verbose=False, auto_balance=False, device='cuda')
     
 
-    labels = np.array(testData[:,:,:][1][:, -1, 0].cpu())    
+    labels = np.array(testData[:,:,:][1][:, -1, 0].cpu())
     test_inputs = testData[:, :, :][0].cpu().numpy()
     db = eval_on_test_set(net, testData)
     accuracy = net.accuracy(testData[:,:,:], outputMask=testOutputMask)
@@ -659,9 +851,14 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
         zero_mat_pca = pca_handler.transform(np.zeros_like(W_ro))    
         plot_pca(hs_pca, labels, zero_mat_pca)
  
+analyze_network_discrete('', True)
+analyze_network_discrete('TEST_50ev_NO_RANDOM_5e-4_CORRECT_LR', False)
 # analyze_network_discrete('CONTINUE_TWICE_SCHEDULE', False)
-analyze_network_discrete('MORRIS_LECAR_FIT_5e-4_RANDOM_LENGTH_CONTINUE_1e-4_BSIZE_4', False)
-# analyze_network_discrete('HH_FAST_FIT_5e-4_RANDOM_LENGTH', True)
+# analyze_network_discrete('MORRIS_LECAR_FIT_5e-4_RANDOM_LENGTH_CONTINUE_1e-4_BSIZE_4', False)
+# analyze_network_discrete('HH_FAST_OUT_OF_SYNC_1e-3', True)
+analyze_network_discrete('RANDOM_EL_MNH_HH_5e-4_KYLE_SETUP_NO_SCHEDULE', False)
+exit()
+analyze_network_discrete('ML_FIT_5e-4_RANDOM_LENGTH_FIXED_CONTINUE_1e-5', False)
 exit()
 analyze_network_discrete('MORRIS_LECAR_FIT_5e-4_CONTINUE_5e-5', False)
 analyze_network_discrete('CONTINUE_FAST_HH', False)

@@ -206,12 +206,13 @@ def plot_pca(hs_pca, labels, zero_mat_pca = None):
         ax2.set_title('Hidden state PC plots (color by sequence location)')
     plt.show()
 
-def input_vector_to_words(sample, word_list):
+def input_vector_to_words(sample, toy_params):
     ''' Convert an input which is of size [tsteps, input size] to a word 
     consisting of indices corresponding to a dictionary of words (shape [tsteps]). '''
     
     # Measure which word in the word_list (vectors) has minimal distance for each timstep.
-    dists = word_list.reshape(word_list.shape[0], 1, -1) - sample.reshape(1, *sample.shape)
+    words = np.array([toy_params['word_to_input_vector'][word] for word in toy_params['words']])
+    dists = words.reshape(words.shape[0], 1, -1) - sample.reshape(1, *sample.shape)
     dists = np.linalg.norm(dists, axis=2) # Shape [# words, tsteps].
     return np.argmin(dists, axis=0) # Shape [tsteps].
 
@@ -228,12 +229,11 @@ def get_extreme_data(data, labels, toy_params, above_thresh = 0.0, below_thresh 
     in the sense that there is a lot or very little evidence for correct label. 
     Will check the percent of label in each sample and select ones above 
     above_thresh and below below_thresh.'''
-    words = np.array([toy_params['word_to_input_vector'][word] for word in toy_params['words']])
     percent_label = np.zeros(data.shape[0]) # Percent of input that corresponds to label.
     for i in range(data.shape[0]):
         # Convert input sample from string of random binary vectors to indices for evidence.
         label, sample = labels[i], data[i] # sample is shape [T, word len].
-        evid_vec = input_vector_to_words(sample, words)
+        evid_vec = input_vector_to_words(sample, toy_params)
         percent_label[i] = get_percents_sample(evid_vec, toy_params['n_classes'])[label]
         
     if debug:
@@ -250,14 +250,13 @@ def get_extreme_data(data, labels, toy_params, above_thresh = 0.0, below_thresh 
 
 def cutoff_data(data, labels, toy_params, cutoff_ts = -1):
     ''' Cutoff samples so that at and after cutoff_ts all the input is just null (except for EOS).'''
-    words = np.array([toy_params['word_to_input_vector'][word] for word in toy_params['words']])
     null_vec = toy_params['word_to_input_vector']['null']
     for i in range(data.shape[0]):
         sample = data[i]
         sample[cutoff_ts:-1] = null_vec
         
         # Relabel based on new input sample.
-        evid_vec = input_vector_to_words(sample, words)
+        evid_vec = input_vector_to_words(sample, toy_params)
         percents = get_percents_sample(evid_vec, toy_params['n_classes'])
         labels[i] = np.argmax(percents)
     return data, labels

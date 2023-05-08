@@ -19,6 +19,7 @@ import sys
 sys.path.append('mpn') 
 from net_utils import StatefulBase, xe_classifier_accuracy
 from utils import plot_accuracy
+import os
 
 class HH(torch.jit.ScriptModule):
     def __init__(self, L, device):
@@ -31,7 +32,7 @@ class HH(torch.jit.ScriptModule):
         
         # HH parameters. These can be tweaked after initializing the HH model.
         self.gna = 40.0; self.gk = 35.0; self.gl = 0.3;
-        self.Ena = 55.0; self.Ek = -77.0; self.El = -65.0;
+        self.Ena = 55.0; self.Ek = -77.0; self.El = -65.0; 
         self.Iapp = 0.5; self.Vt = -3.0; self.Kp = 8.0; 
         self.dt = 0.1;
         self.device = device
@@ -42,14 +43,31 @@ class HH(torch.jit.ScriptModule):
         self.divs = torch.tensor([-9.0, -9.0, -12.0, 9.0, 9.0, 12.0]).view(-1, 1, 1).to(self.device)
         self.muls = torch.tensor([0.182, 0.02, 0.0, -0.124, -0.002, 0.0]).view(-1, 1, 1).to(self.device)
         
-    def reset_state(self, B, randomize=True):
-        self.V = torch.ones((B, self.L)).to(self.device) * -65.0
-        if randomize:
-            self.V += torch.normal(torch.zeros_like(self.V), 5.0) # Add some noise to initial conditions.
+        if os.path.exists(f'EL_random_{L}.pt'):
+            self.El = torch.load(f'EL_random_{L}.pt').to(self.device)
+        else:
+            self.El = torch.ones((1, L)).to(self.device) * self.El
+            self.El = torch.normal(self.El, 1.5)
+            torch.save(self.El, f'EL_random_{L}.pt')
+            
+        # self.Iapp = torch.ones((1, L)) * self.Iapp
+        # self.Iapp = nn.Parameter(self.Iapp).to(self.device)
+
+         # Add some random noise to each nueron mul
+        # self.muls = self.muls.reshape((-1, 1, 1)).repeat(1, 1, L)
+        # self.muls = self.muls + torch.rand(self.muls.shape).to(self.device) * 5e-3
+        
+    def reset_state(self, B):
+        self.V = torch.ones((B, self.L)).to(self.device) * self.El
         self.T = torch.zeros_like(self.V).to(self.device)
                 
         # Gating variables
-        self.K = torch.zeros((3, B, self.L)).to(self.device)
+        if os.path.exists(f'gating_variables_random_{B}_{self.L}.pt'):
+            self.K = torch.load(f'gating_variables_random_{B}_{self.L}.pt').to(self.device)
+        else:
+            self.K = torch.normal(torch.zeros((3, B, self.L)) + 0.5, 0.1).to(self.device)
+            torch.save(self.K, f'gating_variables_random_{B}_{self.L}.pt')
+        # self.y = torch.zeros_like(self.V).to(self.device)
 
     @torch.jit.script_method
     def forward(self, z):
@@ -68,13 +86,15 @@ class HH(torch.jit.ScriptModule):
         pow1 = self.gna * (m ** 3) * h
         pow2 = self.gk * n ** 4
         G_scaled = (self.dt / 2) * (pow1 + pow2 + self.gl)
+                                    # + self.y * self.gs * self.Es)
         E = pow1 * self.Ena + pow2 * self.Ek + self.gl * self.El
+        # + self.y * self.gs * self.Es
 
         # V update.
         self.V = (self.dt * (E + self.Iapp + z) +  (1 - G_scaled) * self.V.clone()) / (1 + G_scaled)
 
         # Calculate gating variable intermediate rate quantities.
-        v_off = self.V[:, :] + self.offs
+        v_off = self.V + self.offs
         EXP = torch.exp(v_off / self.divs) # Optimization: do all exponentials at once. I've found this to shave ~20% time off.           
         scaled_frac = self.muls / (1 - EXP) # Optimization: compute these terms in a batch. MOST HAVE FORM: k * (v + off) / (1 - exp).
 
@@ -88,6 +108,10 @@ class HH(torch.jit.ScriptModule):
         # Gating Variable update.
         sum_scaled = self.dt/2 * (aK+bK)
         self.K = (self.dt * aK + (1 - sum_scaled) * self.K.clone()) / (1 + sum_scaled) # Note similarity with V update above
+        
+        # sum_scaled2 = self.dt / 2 * (self.a_d * z + self.a_r)
+        # self.y = (self.dt * self.a_d * z + (1 - sum_scaled2) * self.y.clone()) / (1 + sum_scaled2)
+        
         self.T = torch.sigmoid((self.V - self.Vt) / self.Kp)
         return self.T
     
@@ -106,6 +130,8 @@ class HH_Fast(torch.jit.ScriptModule):
         self.Iapp = 0.0; self.Vt = -3.0; self.Kp = 8.0; 
         self.dt = 0.1;
         self.device = device
+        
+        self.phase_shift = torch.linspace(0.0, 10.0, L).reshape(1, L).to(self.device)
         
         # Offsets and divisors for gating variable update rates.
         # For their uses, see below.
@@ -144,7 +170,8 @@ class HH_Fast(torch.jit.ScriptModule):
         E = pow1 * self.Ena + pow2 * self.Ek + self.gl * self.El
 
         # V update.
-        self.V = (self.dt * (E + self.Iapp + z) +  (1 - G_scaled) * self.V.clone()) / (1 + G_scaled)
+        I_in = self.Iapp + z + self.phase_shift
+        self.V = (self.dt * (E + I_in) +  (1 - G_scaled) * self.V.clone()) / (1 + G_scaled)
 
         # Calculate gating variable intermediate rate quantities.
         inf = torch.sigmoid((self.V - self.inf_V12) / self.inf_k)
@@ -196,7 +223,56 @@ class MorrisLecar(torch.jit.ScriptModule):
         self.V = (self.V * (1 - self.dt/2 * G) + self.dt * (E + inp)) / (1 + self.dt/2 * G)
         self.T = torch.sigmoid((self.V - self.Vt) / self.Kp)
         return self.T
+   
+class WeightSampler(torch.jit.ScriptModule):
+    '''Class supporting adding S offsets to weight matrix'''
+    def __init__(self, input_dim, output_dim, device='cpu'):
+        super().__init__()
+        self.weight = nn.Linear(output_dim, input_dim, bias=False).weight # note transpose
+        self.weight = nn.Parameter(self.weight.to(device))
+        self.noise = torch.zeros(()).to(device)
+        self.W_noisy = torch.zeros(()).to(device)
+        self.set_params(1, 0.0)
+        self.noisify()
+        self.active = False
+        
+    def set_params(self, S, stddev):
+        self.S = S
+        self.stddev = stddev
     
+    def noisify(self):
+        # Copies of weight for noisy sampling over batches and S samples.
+        self.W_noisy = self.weight.data
+        self.W_noisy = self.W_noisy
+        self.W_noisy = self.W_noisy.repeat(self.S, 1, 1, 1) # [S, 1, IN, OUT], 1 is for batch dim.
+
+        self.noise = torch.zeros_like(self.W_noisy)
+        for s in range(1, self.S): # No noise in first sample.
+            i, j = s % self.weight.shape[0], s // self.weight.shape[0]
+            self.noise[s, 0, i, j] = self.stddev
+
+        self.noise[0] *= 0.0 # No noise added to first sample. This is needed for gradient calculation!
+        self.W_noisy += self.noise
+        
+    def set_active(self, active):
+        self.active = active
+        
+    def compute_grad(self, losses):
+        # Sum 1/S * loss(v_i) * (v_i - mu_i) / sigma_i^2 
+        smpls = self.noise.reshape(self.S, -1) # Reshape for easier multiplication
+        grad = torch.mean(losses.reshape(self.S, 1) * smpls, 0) / (self.stddev ** 2)
+        return grad.reshape(self.weight.shape)
+
+    @torch.jit.script_method 
+    def forward(self, x):
+        if not self.active:
+            return torch.matmul(x, self.weight) # Normal weight vector multiplication.
+        
+        # Reshape dims to extract sample dim and batch dim.
+        dims = (self.S, -1, 1, x.shape[-1])
+        z = torch.matmul(x.view(dims), self.W_noisy)
+        return z.reshape((x.shape[0], -1)) 
+   
 class VanillaBNN(StatefulBase):
     ''' Implements a network of biological (or spiking) neurons with a specified neuron model type. '''
     def __init__(self, net_params, device = 'cpu'):
@@ -219,10 +295,11 @@ class VanillaBNN(StatefulBase):
         self.filter_len = net_params['filter_length']
 
         # Initialize layers
-        self.W_inp = nn.Linear(self.n_inputs, self.n_hidden)
-        self.W_rec = nn.Linear(self.n_hidden, self.n_hidden)
-        self.W_ro = nn.Linear(self.n_hidden, self.n_outputs)
+        self.W_inp = WeightSampler(self.n_inputs, self.n_hidden, device)
+        self.W_rec = WeightSampler(self.n_hidden, self.n_hidden, device)
+        self.W_ro =  WeightSampler(self.n_hidden, self.n_outputs, device)
         self.z1 = torch.zeros(())
+        self.z2 = torch.zeros(())
         
         self.use_snn = net_params.get('use_snn', False)
         if self.use_snn:
@@ -230,13 +307,19 @@ class VanillaBNN(StatefulBase):
             spike_grad = surrogate.fast_sigmoid(slope=25)
             self.hidden_neurons = snn.Leaky(beta=net_params['snn_beta'], spike_grad=spike_grad)
         else:
-            self.hidden_neurons = MorrisLecar(self.n_hidden, device, phi = 2./30.0, V3 = 12., V4 = 17.)
+            self.hidden_neurons = HH(self.n_hidden, device)
+            # self.hidden_neurons = MorrisLecar(self.n_hidden, device, phi = 2./30.0, V3 = 12., V4 = 17.)
             # self.hidden_neurons = HH_Fast(self.n_hidden, device)
 
         self.reset_state()
         self.trunc = net_params.get('trunc', -1) # Truncation for TBTT.
         self.n_per_step = net_params.get('n_per_step', 1) # For how many timesteps should the same batch input be fed in?
         self.random_start = net_params.get('random_start', 0) # Random start data so we can be robust to sequence length.
+        self.softmax = net_params.get('softmax', True)
+        self.noise_std = net_params.get('noise_std', 0.0)
+        
+        self.active_param = 0
+        self.params = [self.W_inp, self.W_rec, self.W_ro]
 
     def reset_state(self, batchSize=1):
         if self.use_snn:
@@ -262,7 +345,7 @@ class VanillaBNN(StatefulBase):
         cur_inp = self.W_inp(x)
         cur_rec = self.W_rec(self.spk_hidden)
         z1 = cur_inp + cur_rec
-        z1 = z1 + torch.normal(torch.zeros_like(z1), 0.0)
+        z1 = z1 + torch.normal(torch.zeros_like(z1), self.noise_std)
         
         # Pass input through hidden neurons.
         if self.use_snn:
@@ -273,10 +356,13 @@ class VanillaBNN(StatefulBase):
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()
 
-        self.z1[:, t, :] = mem_hidden
+        self.z1[:, t, :] = cur_inp
         
         z2 = self.W_ro(spk_hidden)
-        spk_output = F.softmax(z2, dim = -1) # No output neurons!
+        self.z2[:, t, :] = z2
+        spk_output = z2
+        if self.softmax:
+            spk_output = F.softmax(z2, dim = -1) # No output neurons!
             
         # Saves all internal states
         self.spk_hidden = spk_hidden
@@ -288,35 +374,26 @@ class VanillaBNN(StatefulBase):
             self.trunc = batch[1].shape[1]
             
         T = batch[1].shape[1] * self.n_per_step # Simulate for longer than the batch input. 
+        B = batch[1].shape[0]
         self.reset_state(batchSize=batch[0].shape[0])
 
         # Record the final layer
+        print(batch[1].shape[1], T, self.n_outputs, batch[0].shape)
         out_size = torch.Size([batch[1].shape[0], T, self.n_outputs]) # [B, T, Ny]
         spk_out = torch.empty(out_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0 # This has to be a float, otherwise causes gradient problems
+        self.z2 = torch.zeros_like(spk_out)
         
         hidden_size = torch.Size([batch[1].shape[0], T, self.n_hidden]) # [B, T, Nh]
         self.z1 = torch.empty(hidden_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0
 
-        random_start = 0 if self.random_start <= 0 else np.random.randint(0, self.random_start) 
-        for time_idx in range(random_start, T):
+        # Simulate population of neurons over time.
+        for time_idx in range(T):
             bidx = time_idx // self.n_per_step
             x = batch[0][:, bidx, :] # [B, Nx]
             
             grad_cap = batch[0].shape[1] - self.trunc
             with torch.set_grad_enabled(bidx >= grad_cap):
                 spk_out[:, time_idx, :] = self(x, time_idx)
-                                
-        self.counter = self.__dict__.get("counter", -1) + 1
-        if self.counter % 10 == 0:
-            plt.subplot(2,1,1)
-            plt.plot(self.z1[0, :, :3].detach().cpu())
-            plt.subplot(2,1,2)
-            plt.plot(spk_out[0, :, :].detach().cpu())
-            plt.show()
-            
-            if self.hist is not None and len(self.hist['train_loss']) > 0:
-                plot_accuracy(self.hist)
-                plt.show()
 
         filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)
         spk_out_conv = torch.transpose(spk_out, 1, 2) # B, T, Ny -> B, Ny, T (for convolve along dim=2)
@@ -324,6 +401,44 @@ class VanillaBNN(StatefulBase):
 
         spk_out_cum = F.conv1d(spk_out_conv, filter, padding=self.filter_len-1)[:, :, :-self.filter_len+1] #output: B*Ny, 1, T
         spk_out_cum = torch.transpose(spk_out_cum.reshape(spk_out.shape[0], spk_out.shape[2], spk_out.shape[1]), 1, 2) # B*Ny, 1, T -> B, Ny, T -> B, T, Ny
+        
+        if self.random_start > 0:
+            for b in range(B):
+                end = np.random.randint(batch[1].shape[1] - self.random_start, batch[1].shape[1])
+                end = end * self.n_per_step
+                spk_out_cum[b, end:] = spk_out_cum[b, end]
+                spk_out[b, end:] = spk_out[b, end]
+                                  
+        self.counter = self.__dict__.get("counter", -1) + 1
+        if self.counter % 10 == 0:
+            for b in range(1):
+                plt.figure(dpi=500)
+                plt.subplot(2,2,2)
+                from utils import input_vector_to_words
+                words = input_vector_to_words(batch[0][b].detach().cpu().numpy(), self.toy_params)
+                print(words)
+                print(self.toy_params['words'])
+                mem = self.z1[b, :, :].detach().cpu()
+                plt.imshow(words.reshape((1, -1)), aspect='auto', vmin = 0, vmax = 4, cmap='gist_rainbow')
+                # cbar = plt.colorbar(ticks = [0, 1, 2, 3, 4])
+                # cbar.ax.set_yticklabels(self.toy_params['words'])
+                
+                
+                plt.subplot(2,2,3)
+                plt.imshow(mem.T, aspect='auto', cmap='binary', interpolation='none')
+                
+                plt.subplot(2,2,1)
+                plt.plot(self.z2[b, 100:, :].detach().cpu(), linewidth=1)
+                
+                plt.subplot(2,2,4)
+                plt.plot(spk_out_cum[b, 100:, :].detach().cpu(), linewidth=1)
+                plt.suptitle(f'Label = {batch[1][b, 0].item()}')
+                plt.show()
+            
+            if self.hist is not None and len(self.hist['train_loss']) > 0:
+                plot_accuracy(self.hist)
+                plt.show()
+
         spk_out_cum = spk_out_cum[:, -batch[1].shape[1]:, :] # Make output compatible with mask. Really only care about final timestep value. 
 
         if debug:
@@ -331,3 +446,146 @@ class VanillaBNN(StatefulBase):
             return db
         else:
             return spk_out_cum
+        
+    def _train_epoch(self, trainData, validBatch=None, batchSize=1, earlyStop=True, earlyStopValid=False, validStopThres=None, 
+                   trainOutputMask=None, validOutputMask=None, minMaxIter=(-2, 1e7)):
+        for b in range(0, trainData.tensors[0].shape[0], batchSize):  #trainData.tensors[0] is shape [B,T,Nx]
+
+            S = self.params[self.active_param].S
+            
+            inp, target = trainData[b:b+batchSize,:,:] 
+            inp = inp.repeat(S, 1, 1)
+            target = target.repeat(S, 1, 1)
+            trainBatch = (inp, target)
+            print(inp.shape, target.shape)
+            
+            if trainOutputMask is not None: 
+                trainOutputMaskBatch = trainOutputMask[b:b+batchSize,:,:] 
+            else:
+                trainOutputMaskBatch = None
+                
+            self.params[self.active_param].set_active(True)
+            self.params[self.active_param].noisify()
+      
+            AUTODIFF = False
+            
+            self.optimizer.zero_grad()
+            out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,T,Ny]
+            loss_fn = nn.CrossEntropyLoss(reduction = 'none')
+            
+            losses = loss_fn(out.reshape((-1, 3)), target.reshape(-1))
+            losses = torch.mean(losses.reshape((S, -1)), -1) # Size (S)
+            loss = losses[0]
+                
+            if AUTODIFF:  
+   #             loss = self.average_loss(trainBatch, out=out, outputMask=trainOutputMaskBatch)
+                loss.backward()
+            
+                # Zero NaNs in gradients. This can sometimes pop up with BNNs.
+                total, corrupted = 0, 0
+                grad_norm = 0.0
+                for name, param in self.named_parameters():
+                    if torch.any(param.grad.isnan()):
+                        corrupted += 1
+                    param.grad = torch.nan_to_num(param.grad, 0.0)
+                    total += 1
+                    
+                    grad_norm += param.grad.norm()
+                    
+                print(f'Percentage of corrupted parameters: {100 * corrupted / total}%')
+                print(f'Grad norm: {grad_norm}')
+          
+                if self.gradientClip is not None:
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradientClip)          
+            else:
+                grad = self.params[self.active_param].compute_grad(losses)
+                self.params[self.active_param].weight.grad = grad
+                
+            self.optimizer.step() 
+            
+            # Disable samplers.
+            for param in self.params:
+                param.set_active(False)
+                
+            self.active_param = (self.active_param + 1) % len(self.params)
+
+            # Note: even though this is called every batch, only runs validation batch every monitor_freq batches
+            self._monitor(trainBatch, validBatch=validBatch, out=out, loss=loss, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask) 
+            # self._monitor(trainBatch, validBatch=validBatch, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask)  
+       
+            # if earlyStopValid and len(self.hist['valid_loss'])>1 and self.hist['valid_loss'][-1] > self.hist['valid_loss'][-2]:
+            STEPS_BACK = 10
+            # Stop if the avg_valid_loss has asymptoted (or starts to increase)
+            # (since rolling average is 10 monitors, 2*STEPS_BACK makes sure there are two full averages available for comparison,
+            #  subtracting self.hist['monitor_thresh'][-1] prevents this threshold from being tested when a network continues training,)
+            if self.hist['iter'] > minMaxIter[0]: # Only early stops when above minimum iteration count
+                if earlyStopValid and (len(self.hist['iters_monitor']) - self.hist['monitor_thresh'][-1]) > 2*STEPS_BACK:
+                    if 1.0 * self.hist['avg_valid_loss'][-STEPS_BACK] < self.hist['avg_valid_loss'][-1]:
+                        print('  Early Stop: avg_valid_loss saturated, current (-1): {:.2e}, prev (-{}): {:.2e}, acc: {:.2f}'.format(
+                            self.hist['avg_valid_loss'][-1], STEPS_BACK, self.hist['avg_valid_loss'][-STEPS_BACK], self.hist['avg_valid_acc'][-1]))
+                        return True
+                if validStopThres is not None and self.hist['avg_valid_acc'][-1] > validStopThres:
+                    print('  Early Stop: valid accuracy threshold reached: {:.2f}'.format(
+                        self.hist['avg_valid_acc'][-1]
+                    ))
+                    return True
+                if self.hist['iter'] > minMaxIter[1]: # Early stop if above maximum numbers of iters
+                    print('  Early Stop: maximum iterations reached, acc: {:.2f}'.format(
+                        self.hist['avg_valid_acc'][-1]
+                    ))
+                    return True
+            # if earlyStop and sum(self.hist['train_acc'][-5:]) >= 4.99: #not a proper early-stop criterion but useful for infinite data regime
+            #     return True
+            
+        return False  
+        
+    
+class VanillaGRU(StatefulBase):
+    ''' Implements a network of biological (or spiking) neurons with a specified neuron model type. '''
+    def __init__(self, net_params, device = 'cpu'):
+        super(VanillaGRU,self).__init__()
+
+        self.n_inputs = net_params['n_inputs']
+        self.n_hidden = net_params['n_hidden']
+        self.n_outputs = net_params['n_outputs']
+        
+        self.loss_fn = F.cross_entropy # Reductions is mean by default
+        if net_params.get('loss_fn', '') == 'mse':
+            def mse_loss(x, y):
+                one_hot = F.one_hot(y, num_classes = self.n_outputs).float()
+                return F.mse_loss(x, one_hot)
+            self.loss_fn = mse_loss
+        self.acc_fn = xe_classifier_accuracy
+        
+        self.gru = nn.GRU(self.n_inputs, self.n_hidden, batch_first = True)
+        self.linear1 = nn.Linear(self.n_hidden, self.n_outputs)
+        
+        # Uses a given filter to convolve the the spike counts over time. 
+        # This is a retrospective padding, so will have edge effects at start 
+        self.filter_len = net_params['filter_length']
+        
+        self.n_per_step = net_params.get('n_per_step', 1) # For how many timesteps should the same batch input be fed in?
+        self.random_start = net_params.get('random_start', 0) # Random start data so we can be robust to sequence length.
+        self.softmax = net_params.get('softmax', True)
+
+    def evaluate(self, batch, debug=False):
+        inp = torch.repeat_interleave(batch[0], self.n_per_step, dim=1)
+        out, _ = self.gru(inp)
+        out = self.linear1(out)
+        
+        if self.random_start > 0:
+            for b in range(batch[0].shape[0]):
+                end = np.random.randint(batch[1].shape[1] - self.random_start, batch[1].shape[1])
+                end = end * self.n_per_step
+                out[b, end:] = out[b, end]
+                
+        self.out = out
+
+        filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)
+        out_conv = torch.transpose(out, 1, 2) # B, T, Ny -> B, Ny, T (for convolve along dim=2)
+        out_conv = out_conv.reshape(-1, out_conv.shape[-1]).unsqueeze(1) # B, Ny, T -> B*Ny, 1, T
+
+        out_cum = F.conv1d(out_conv, filter, padding=self.filter_len-1)[:, :, :-self.filter_len+1] #output: B*Ny, 1, T
+        out_cum = torch.transpose(out_cum.reshape(out.shape[0], out.shape[2], out.shape[1]), 1, 2) # B*Ny, 1, T -> B, Ny, T -> B, T, Ny
+        out_cum = out_cum[:, -batch[1].shape[1]:, :] # Make output compatible with mask. Really only care about final timestep value. 
+        return out_cum
