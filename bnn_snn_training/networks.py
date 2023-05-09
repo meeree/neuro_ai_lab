@@ -226,10 +226,15 @@ class MorrisLecar(torch.jit.ScriptModule):
    
 class WeightSampler(torch.jit.ScriptModule):
     '''Class supporting adding S offsets to weight matrix'''
-    def __init__(self, input_dim, output_dim, device='cpu'):
+    def __init__(self, input_dim, output_dim, device='cpu', trainable = True):
         super().__init__()
-        self.weight = nn.Linear(output_dim, input_dim, bias=False).weight # note transpose
-        self.weight = nn.Parameter(self.weight.to(device))
+        self.weight = nn.Linear(output_dim, input_dim, bias=False).weight.data # note transpose
+        self.weight = self.weight.to(device)
+        if trainable:
+            self.weight = nn.Parameter(self.weight) # Make a trainable param.
+        else:
+            self.weight.requires_grad = False
+            
         self.noise = torch.zeros(()).to(device)
         self.W_noisy = torch.zeros(()).to(device)
         self.set_params(1, 0.0)
@@ -246,12 +251,13 @@ class WeightSampler(torch.jit.ScriptModule):
         self.W_noisy = self.W_noisy
         self.W_noisy = self.W_noisy.repeat(self.S, 1, 1, 1) # [S, 1, IN, OUT], 1 is for batch dim.
 
-        self.noise = torch.zeros_like(self.W_noisy)
-        for s in range(1, self.S): # No noise in first sample.
-            i, j = s % self.weight.shape[0], s // self.weight.shape[0]
-            self.noise[s, 0, i, j] = self.stddev
-
+        self.noise = torch.normal(0.0, self.stddev * torch.ones_like(self.W_noisy))
         self.noise[0] *= 0.0 # No noise added to first sample. This is needed for gradient calculation!
+        
+        # Make sampling sparse
+        # mask = torch.rand_like(self.noise) > 0.8
+        # self.noise = self.noise * mask 
+        
         self.W_noisy += self.noise
         
     def set_active(self, active):
@@ -263,7 +269,6 @@ class WeightSampler(torch.jit.ScriptModule):
         grad = torch.mean(losses.reshape(self.S, 1) * smpls, 0) / (self.stddev ** 2)
         return grad.reshape(self.weight.shape)
 
-    @torch.jit.script_method 
     def forward(self, x):
         if not self.active:
             return torch.matmul(x, self.weight) # Normal weight vector multiplication.
@@ -271,7 +276,7 @@ class WeightSampler(torch.jit.ScriptModule):
         # Reshape dims to extract sample dim and batch dim.
         dims = (self.S, -1, 1, x.shape[-1])
         z = torch.matmul(x.view(dims), self.W_noisy)
-        return z.reshape((x.shape[0], -1)) 
+        return z.reshape((*x.shape[:-1], -1)) 
    
 class VanillaBNN(StatefulBase):
     ''' Implements a network of biological (or spiking) neurons with a specified neuron model type. '''
@@ -296,11 +301,10 @@ class VanillaBNN(StatefulBase):
 
         # Initialize layers
         self.W_inp = WeightSampler(self.n_inputs, self.n_hidden, device)
-        self.W_rec = WeightSampler(self.n_hidden, self.n_hidden, device)
+        self.W_rec = WeightSampler(self.n_hidden, self.n_hidden, device, trainable=False)
         self.W_ro =  WeightSampler(self.n_hidden, self.n_outputs, device)
-        self.z1 = torch.zeros(())
-        self.z2 = torch.zeros(())
-        
+        self.params = [self.W_inp, self.W_ro]
+                
         self.use_snn = net_params.get('use_snn', False)
         if self.use_snn:
             # Surrogate gradients
@@ -312,14 +316,12 @@ class VanillaBNN(StatefulBase):
             # self.hidden_neurons = HH_Fast(self.n_hidden, device)
 
         self.reset_state()
-        self.trunc = net_params.get('trunc', -1) # Truncation for TBTT.
         self.n_per_step = net_params.get('n_per_step', 1) # For how many timesteps should the same batch input be fed in?
         self.random_start = net_params.get('random_start', 0) # Random start data so we can be robust to sequence length.
         self.softmax = net_params.get('softmax', True)
         self.noise_std = net_params.get('noise_std', 0.0)
         
         self.active_param = 0
-        self.params = [self.W_inp, self.W_rec, self.W_ro]
 
     def reset_state(self, batchSize=1):
         if self.use_snn:
@@ -335,14 +337,13 @@ class VanillaBNN(StatefulBase):
         
         self.timers = torch.zeros_like(self.spk_hidden)
 
-    def forward(self, x, t):
+    def forward(self, cur_inp, t):
         """
         Runs a single forward pass of the network 
         (iterated over in self.evaluate() for sequential data)
 
-        x.shape: (B, num_inputs)
+        z.shape: (B, num_inputs)
         """            
-        cur_inp = self.W_inp(x)
         cur_rec = self.W_rec(self.spk_hidden)
         z1 = cur_inp + cur_rec
         z1 = z1 + torch.normal(torch.zeros_like(z1), self.noise_std)
@@ -355,11 +356,8 @@ class VanillaBNN(StatefulBase):
         else:
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()
-
-        self.z1[:, t, :] = cur_inp
         
         z2 = self.W_ro(spk_hidden)
-        self.z2[:, t, :] = z2
         spk_output = z2
         if self.softmax:
             spk_output = F.softmax(z2, dim = -1) # No output neurons!
@@ -370,86 +368,78 @@ class VanillaBNN(StatefulBase):
         return spk_output
 
     def evaluate(self, batch, debug=False): 
-        if self.trunc < 0:
-            self.trunc = batch[1].shape[1]
-            
+        W = self.filter_len # We only need to store the last W timesteps for task.
+        
         T = batch[1].shape[1] * self.n_per_step # Simulate for longer than the batch input. 
         B = batch[1].shape[0]
         self.reset_state(batchSize=batch[0].shape[0])
-
-        # Record the final layer
-        print(batch[1].shape[1], T, self.n_outputs, batch[0].shape)
-        out_size = torch.Size([batch[1].shape[0], T, self.n_outputs]) # [B, T, Ny]
-        spk_out = torch.empty(out_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0 # This has to be a float, otherwise causes gradient problems
-        self.z2 = torch.zeros_like(spk_out)
         
-        hidden_size = torch.Size([batch[1].shape[0], T, self.n_hidden]) # [B, T, Nh]
-        self.z1 = torch.empty(hidden_size, dtype=torch.float, layout=batch[1].layout, device=batch[1].device)*0
+        plot = False
+        if B == 100:
+            plot = True
 
+            # Things to plot
+            n_samples = 1
+            sample_freq = 10
+            hidden_record = np.zeros((n_samples, T // sample_freq, self.n_hidden))
+            out_record = np.zeros((n_samples, T // sample_freq, self.n_outputs)) 
+        
+        # Record the final layer
+        shape = (B, W, self.n_outputs) # [B, W, Ny]
+        spk_out = torch.zeros(shape, dtype = torch.float, layout = batch[1].layout)
+        spk_out = spk_out.to(batch[1].device)
+        
         # Simulate population of neurons over time.
+        zin = self.W_inp(batch[0])
         for time_idx in range(T):
             bidx = time_idx // self.n_per_step
-            x = batch[0][:, bidx, :] # [B, Nx]
+            out = self(zin[:, bidx, :], time_idx)
             
-            grad_cap = batch[0].shape[1] - self.trunc
-            with torch.set_grad_enabled(bidx >= grad_cap):
-                spk_out[:, time_idx, :] = self(x, time_idx)
-
-        filter = torch.tensor(np.ones((1, 1, self.filter_len,)), dtype=torch.float).to(batch[0].device)
-        spk_out_conv = torch.transpose(spk_out, 1, 2) # B, T, Ny -> B, Ny, T (for convolve along dim=2)
-        spk_out_conv = spk_out_conv.reshape(-1, spk_out_conv.shape[-1]).unsqueeze(1) # B, Ny, T -> B*Ny, 1, T
-
-        spk_out_cum = F.conv1d(spk_out_conv, filter, padding=self.filter_len-1)[:, :, :-self.filter_len+1] #output: B*Ny, 1, T
-        spk_out_cum = torch.transpose(spk_out_cum.reshape(spk_out.shape[0], spk_out.shape[2], spk_out.shape[1]), 1, 2) # B*Ny, 1, T -> B, Ny, T -> B, T, Ny
+            if plot:
+                if time_idx % sample_freq == 0:
+                    hidden_record[:, time_idx // sample_freq, :] = self.mem_hidden[:n_samples].detach().cpu().numpy()
+                    out_record[:, time_idx // sample_freq, :] = out[:n_samples].detach().cpu().numpy()
+            
+            # Only write values in final window.
+            write_idx = time_idx - (T - W)
+            if write_idx >= 0:
+                spk_out[:, write_idx, :] = torch.nan_to_num(out)
+                
+        if plot:
+            # hidden_record = hidden_record.detach().cpu().numpy()
+            # out_record = out_record.detach().cpu().numpy()
+            
+            plt.figure(dpi=400)
+            plt.subplot(2,1,1)
+            for b in range(n_samples):
+                plt.plot(hidden_record[b], linewidth=1)
+            plt.title('Hidden Layer')
+                
+            plt.subplot(2,1,2)
+            for b in range(n_samples):
+                plt.plot(out_record[b])
+            plt.title('Output Layer')
+            plt.tight_layout()
+            plt.show()
+            
         
-        if self.random_start > 0:
-            for b in range(B):
-                end = np.random.randint(batch[1].shape[1] - self.random_start, batch[1].shape[1])
-                end = end * self.n_per_step
-                spk_out_cum[b, end:] = spk_out_cum[b, end]
-                spk_out[b, end:] = spk_out[b, end]
-                                  
         self.counter = self.__dict__.get("counter", -1) + 1
         if self.counter % 10 == 0:
-            for b in range(1):
-                plt.figure(dpi=500)
-                plt.subplot(2,2,2)
-                from utils import input_vector_to_words
-                words = input_vector_to_words(batch[0][b].detach().cpu().numpy(), self.toy_params)
-                print(words)
-                print(self.toy_params['words'])
-                mem = self.z1[b, :, :].detach().cpu()
-                plt.imshow(words.reshape((1, -1)), aspect='auto', vmin = 0, vmax = 4, cmap='gist_rainbow')
-                # cbar = plt.colorbar(ticks = [0, 1, 2, 3, 4])
-                # cbar.ax.set_yticklabels(self.toy_params['words'])
-                
-                
-                plt.subplot(2,2,3)
-                plt.imshow(mem.T, aspect='auto', cmap='binary', interpolation='none')
-                
-                plt.subplot(2,2,1)
-                plt.plot(self.z2[b, 100:, :].detach().cpu(), linewidth=1)
-                
-                plt.subplot(2,2,4)
-                plt.plot(spk_out_cum[b, 100:, :].detach().cpu(), linewidth=1)
-                plt.suptitle(f'Label = {batch[1][b, 0].item()}')
-                plt.show()
-            
             if self.hist is not None and len(self.hist['train_loss']) > 0:
                 plot_accuracy(self.hist)
-                plt.show()
+                plt.show()        
 
-        spk_out_cum = spk_out_cum[:, -batch[1].shape[1]:, :] # Make output compatible with mask. Really only care about final timestep value. 
-
-        if debug:
-            db = {'spk_hidden': self.z1, 'spk_out': spk_out}
-            return db
-        else:
-            return spk_out_cum
+        # Return mean of output window
+        return torch.mean(spk_out, 1)
         
     def _train_epoch(self, trainData, validBatch=None, batchSize=1, earlyStop=True, earlyStopValid=False, validStopThres=None, 
                    trainOutputMask=None, validOutputMask=None, minMaxIter=(-2, 1e7)):
         for b in range(0, trainData.tensors[0].shape[0], batchSize):  #trainData.tensors[0] is shape [B,T,Nx]
+            if 'optims' not in self.__dict__:
+                self.optims = []
+                lr = self.optimizer.param_groups[0]['lr']
+                self.optims.append(torch.optim.Adam(self.W_inp.parameters(), lr=lr))
+                self.optims.append(torch.optim.Adam(self.W_ro.parameters(), lr=lr))
 
             S = self.params[self.active_param].S
             
@@ -457,25 +447,33 @@ class VanillaBNN(StatefulBase):
             inp = inp.repeat(S, 1, 1)
             target = target.repeat(S, 1, 1)
             trainBatch = (inp, target)
-            print(inp.shape, target.shape)
             
             if trainOutputMask is not None: 
                 trainOutputMaskBatch = trainOutputMask[b:b+batchSize,:,:] 
             else:
                 trainOutputMaskBatch = None
-                
-            self.params[self.active_param].set_active(True)
-            self.params[self.active_param].noisify()
       
             AUTODIFF = False
             
             self.optimizer.zero_grad()
-            out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,T,Ny]
-            loss_fn = nn.CrossEntropyLoss(reduction = 'none')
-            
-            losses = loss_fn(out.reshape((-1, 3)), target.reshape(-1))
-            losses = torch.mean(losses.reshape((S, -1)), -1) # Size (S)
-            loss = losses[0]
+            self.optims[self.active_param].zero_grad()
+            with torch.set_grad_enabled(AUTODIFF):
+                if not AUTODIFF:
+                    self.params[self.active_param].set_active(True)
+                    self.params[self.active_param].noisify()
+                
+                out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,Ny]
+                loss_fn = nn.CrossEntropyLoss(reduction = 'none')
+                
+                def mse_loss(x, y):
+                    one_hot = F.one_hot(y, num_classes = self.n_outputs).float()
+                    print(x.shape, one_hot.shape)
+                    return F.mse_loss(x, one_hot, reduction='none')
+                loss_fn = mse_loss
+
+                losses = loss_fn(out, target[:, 0, 0]) # Shape [B*S, 3]
+                losses = torch.mean(losses.reshape((S, -1)), -1) # Shape [S]
+                loss = losses[0]
                 
             if AUTODIFF:  
    #             loss = self.average_loss(trainBatch, out=out, outputMask=trainOutputMaskBatch)
@@ -485,6 +483,7 @@ class VanillaBNN(StatefulBase):
                 total, corrupted = 0, 0
                 grad_norm = 0.0
                 for name, param in self.named_parameters():
+                    print(name)
                     if torch.any(param.grad.isnan()):
                         corrupted += 1
                     param.grad = torch.nan_to_num(param.grad, 0.0)
@@ -497,11 +496,13 @@ class VanillaBNN(StatefulBase):
           
                 if self.gradientClip is not None:
                     torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradientClip)          
+           
+                self.optimizer.step() 
             else:
                 grad = self.params[self.active_param].compute_grad(losses)
+                print(f'Grad norm: {grad.norm()}')
                 self.params[self.active_param].weight.grad = grad
-                
-            self.optimizer.step() 
+                self.optims[self.active_param].step() 
             
             # Disable samplers.
             for param in self.params:

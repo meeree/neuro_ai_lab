@@ -547,11 +547,11 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     net_params['n_per_step'] = 40
     toy_params['n_classes'] = 3
     net_params['n_outputs'] = toy_params['n_classes']
-    net_params['loss_fn'] = 'mse'
-    train_params['lr'] = 5e-4
-    train_params['batch_size'] = 150
+    # net_params['loss_fn'] = 'mse'
+    train_params['lr'] = 5e-3
+    train_params['batch_size'] = 50
     # train_params['scheduler'] = 'reducePlateau'
-    net_params['softmax'] = True
+    net_params['softmax'] = False
     # net_params['n_hidden'] = 256
     
     # SNN setup
@@ -565,21 +565,28 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     net = VanillaBNN(net_params, device='cuda').to('cuda')
     
     for param in net.params:
-        param.set_params(100, 0.1)
-        
+        param.set_params(100, 1.0)
+    
+    
     for W in[net.W_ro, net.W_rec, net.W_inp]:
         W.weight.data.fill_(1e-1)
         # W.bias.data.fill_(0.0)
         
         stdv = 1. / (W.weight.size(1) ** 0.5)
-        # W.weight.data.uniform_(-stdv + 1e-1, stdv + 1e-1)
-        # W.bias.data.uniform_(-stdv, stdv)
+        W.weight.data.uniform_(-stdv + 1e-1, stdv + 1e-1)
         
     stdv = 1. / (net.W_rec.weight.size(1) ** 0.5)   
     net.W_rec.weight.data.fill_(1e-3)
     net.hidden_neurons.Iapp = 0.1
-    # net.W_rec.weight.data.uniform_(1e-3 - stdv, 1e-3 + stdv)
+    net.W_rec.weight.data.uniform_(1e-3 - stdv, 1e-3 + stdv)
     
+    # Sparse recurrent weights
+    for i in range(net.W_rec.weight.shape[0]):
+        for j in range(net.W_rec.weight.shape[1]):
+            rand = torch.rand(())
+            if rand > 0.8:
+                net.W_rec.weight.data[i,j] = 1e-3
+
     override = False
     
     # net.trunc = 10
