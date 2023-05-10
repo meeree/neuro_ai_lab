@@ -33,7 +33,8 @@ class HH(torch.jit.ScriptModule):
         # HH parameters. These can be tweaked after initializing the HH model.
         self.gna = 40.0; self.gk = 35.0; self.gl = 0.3;
         self.Ena = 55.0; self.Ek = -77.0; self.El = -65.0; 
-        self.Iapp = 0.5; self.Vt = -3.0; self.Kp = 8.0; 
+        self.Iapp = 0.5; self.Vt = -0.03 / 8; self.Kp = 0.01; 
+        self.Vt = -3.; self.Kp = 8.; 
         self.dt = 0.1;
         self.device = device
         
@@ -301,9 +302,9 @@ class VanillaBNN(StatefulBase):
 
         # Initialize layers
         self.W_inp = WeightSampler(self.n_inputs, self.n_hidden, device)
-        self.W_rec = WeightSampler(self.n_hidden, self.n_hidden, device, trainable=False)
-        self.W_ro =  WeightSampler(self.n_hidden, self.n_outputs, device)
-        self.params = [self.W_inp, self.W_ro]
+        self.W_rec = WeightSampler(self.n_hidden, self.n_hidden, device, trainable=True)
+        self.W_ro = nn.Linear(self.n_hidden, self.n_outputs).to(device)
+        self.params = [self.W_inp, self.W_rec]
                 
         self.use_snn = net_params.get('use_snn', False)
         if self.use_snn:
@@ -311,8 +312,8 @@ class VanillaBNN(StatefulBase):
             spike_grad = surrogate.fast_sigmoid(slope=25)
             self.hidden_neurons = snn.Leaky(beta=net_params['snn_beta'], spike_grad=spike_grad)
         else:
-            self.hidden_neurons = HH(self.n_hidden, device)
-            # self.hidden_neurons = MorrisLecar(self.n_hidden, device, phi = 2./30.0, V3 = 12., V4 = 17.)
+            # self.hidden_neurons = HH(self.n_hidden, device)
+            self.hidden_neurons = MorrisLecar(self.n_hidden, device, phi = 2./30.0, V3 = 12., V4 = 17.)
             # self.hidden_neurons = HH_Fast(self.n_hidden, device)
 
         self.reset_state()
@@ -356,16 +357,17 @@ class VanillaBNN(StatefulBase):
         else:
             spk_hidden = self.hidden_neurons(z1)
             mem_hidden = self.hidden_neurons.V.clone()
-        
-        z2 = self.W_ro(spk_hidden)
-        spk_output = z2
-        if self.softmax:
-            spk_output = F.softmax(z2, dim = -1) # No output neurons!
-            
+
         # Saves all internal states
         self.spk_hidden = spk_hidden
         self.mem_hidden = mem_hidden
-        return spk_output
+        
+    def calculate_output(self, spk_hidden):
+        spk_out = self.W_ro(spk_hidden)
+        if self.softmax:
+            spk_out = F.softmax(spk_out, dim = -1)
+        spk_out = torch.nan_to_num(spk_out)
+        return spk_out                
 
     def evaluate(self, batch, debug=False): 
         W = self.filter_len # We only need to store the last W timesteps for task.
@@ -375,7 +377,7 @@ class VanillaBNN(StatefulBase):
         self.reset_state(batchSize=batch[0].shape[0])
         
         plot = False
-        if B == 100:
+        if False and B == 100:
             plot = True
 
             # Things to plot
@@ -384,27 +386,36 @@ class VanillaBNN(StatefulBase):
             hidden_record = np.zeros((n_samples, T // sample_freq, self.n_hidden))
             out_record = np.zeros((n_samples, T // sample_freq, self.n_outputs)) 
         
-        # Record the final layer
-        shape = (B, W, self.n_outputs) # [B, W, Ny]
-        spk_out = torch.zeros(shape, dtype = torch.float, layout = batch[1].layout)
+        # Record the layers within readout window.
+        spk_out = torch.zeros((B, W, self.n_outputs), dtype = torch.float, layout = batch[1].layout)
         spk_out = spk_out.to(batch[1].device)
-        
+
         # Simulate population of neurons over time.
-        zin = self.W_inp(batch[0])
+        USE_AUTODIFF = False
+        with torch.set_grad_enabled(USE_AUTODIFF):
+            zin = self.W_inp(batch[0])
+            
         for time_idx in range(T):
             bidx = time_idx // self.n_per_step
-            out = self(zin[:, bidx, :], time_idx)
-            
-            if plot:
-                if time_idx % sample_freq == 0:
-                    hidden_record[:, time_idx // sample_freq, :] = self.mem_hidden[:n_samples].detach().cpu().numpy()
-                    out_record[:, time_idx // sample_freq, :] = out[:n_samples].detach().cpu().numpy()
-            
-            # Only write values in final window.
+            with torch.set_grad_enabled(USE_AUTODIFF):
+                self(zin[:, bidx, :], time_idx)
+                
             write_idx = time_idx - (T - W)
             if write_idx >= 0:
-                spk_out[:, write_idx, :] = torch.nan_to_num(out)
-                
+                spk_out[:, write_idx, :] = self.calculate_output(self.spk_hidden)
+            
+            # if plot:
+            #     if time_idx % sample_freq == 0:
+            #         with torch.no_grad():
+            #             hidden_record[:, time_idx // sample_freq, :] = self.mem_hidden[:n_samples].detach().cpu().numpy()       
+            #             out_record[:, time_idx // sample_freq, :] = self.W_ro(self.mem_hidden[:n_samples])
+            #             if self.softmax:
+            #                 out_record[:, time_idx // sample_freq, :] = F.softmax(out_record[:, time_idx // sample_freq, :])
+            #             out_record[:, time_idx // sample_freq, :] = out_record[:, time_idx // sample_freq, :].detach().cpu().numpy()
+        
+        # Calculate output from hidden states by a linear transform.  
+        # spk_out = self.calculate_output(spk_hidden)               
+                        
         if plot:
             # hidden_record = hidden_record.detach().cpu().numpy()
             # out_record = out_record.detach().cpu().numpy()
@@ -414,6 +425,9 @@ class VanillaBNN(StatefulBase):
             for b in range(n_samples):
                 plt.plot(hidden_record[b], linewidth=1)
             plt.title('Hidden Layer')
+            
+            for time_idx in range(hidden_record.shape[1]):
+                out_record[:, ]
                 
             plt.subplot(2,1,2)
             for b in range(n_samples):
@@ -425,7 +439,9 @@ class VanillaBNN(StatefulBase):
         
         self.counter = self.__dict__.get("counter", -1) + 1
         if self.counter % 10 == 0:
-            if self.hist is not None and len(self.hist['train_loss']) > 0:
+            check1 = len(self.hist['iters_monitor']) == len(self.hist['valid_loss'])
+            check2 = len(self.hist['iters_monitor']) == len(self.hist['train_loss'])
+            if self.hist is not None and len(self.hist['train_loss']) > 0 and check1 and check2:
                 plot_accuracy(self.hist)
                 plt.show()        
 
@@ -439,76 +455,102 @@ class VanillaBNN(StatefulBase):
                 self.optims = []
                 lr = self.optimizer.param_groups[0]['lr']
                 self.optims.append(torch.optim.Adam(self.W_inp.parameters(), lr=lr))
+                # self.optims.append(torch.optim.Adam(self.W_rec.parameters(), lr=lr))
                 self.optims.append(torch.optim.Adam(self.W_ro.parameters(), lr=lr))
-
-            S = self.params[self.active_param].S
-            
+                
             inp, target = trainData[b:b+batchSize,:,:] 
-            inp = inp.repeat(S, 1, 1)
-            target = target.repeat(S, 1, 1)
             trainBatch = (inp, target)
-            
+            loss_fn = nn.CrossEntropyLoss(reduction = 'none')
+                            
+            # def mse_loss(x, y):
+            #     one_hot = F.one_hot(y, num_classes = self.n_outputs).float()
+            #     print(x.shape, one_hot.shape)
+            #     return F.mse_loss(x, one_hot, reduction='none')
+            # loss_fn = mse_loss
+                
+            # Autograd W_ro step.
+            TRAIN_WRO = True
+            if TRAIN_WRO:
+                self.optims[1].zero_grad()
+                out = self.evaluate(trainBatch)
+                losses = loss_fn(out, target[:, 0, 0]) # Shape [B, 3]
+                loss = torch.mean(losses)
+                loss.backward()
+                self.optims[1].step()
+                
             if trainOutputMask is not None: 
                 trainOutputMaskBatch = trainOutputMask[b:b+batchSize,:,:] 
             else:
                 trainOutputMaskBatch = None
-      
-            AUTODIFF = False
-            
-            self.optimizer.zero_grad()
-            self.optims[self.active_param].zero_grad()
-            with torch.set_grad_enabled(AUTODIFF):
+          
+
+            # Smooth grad step.
+            TRAIN_WINP = True
+            if TRAIN_WINP:
+                S = self.params[self.active_param].S
+                
+                inp = inp.repeat(S, 1, 1)
+                target = target.repeat(S, 1, 1)
+                trainBatch = (inp, target)
+                
+                
+                AUTODIFF = False
+                
                 if not AUTODIFF:
                     self.params[self.active_param].set_active(True)
                     self.params[self.active_param].noisify()
-                
-                out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,Ny]
-                loss_fn = nn.CrossEntropyLoss(reduction = 'none')
-                
-                def mse_loss(x, y):
-                    one_hot = F.one_hot(y, num_classes = self.n_outputs).float()
-                    print(x.shape, one_hot.shape)
-                    return F.mse_loss(x, one_hot, reduction='none')
-                loss_fn = mse_loss
+                else:
+                    self.optimizer.zero_grad()
+                    self.optims[self.active_param].zero_grad()
+    
+                with torch.set_grad_enabled(AUTODIFF):
+                    out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,Ny]
+        
+                    losses = loss_fn(out, target[:, 0, 0]) # Shape [B*S, 3]
+                    losses = torch.mean(losses.reshape((S, -1)), -1) # Shape [S]
+                    loss = losses[0]
 
-                losses = loss_fn(out, target[:, 0, 0]) # Shape [B*S, 3]
-                losses = torch.mean(losses.reshape((S, -1)), -1) # Shape [S]
-                loss = losses[0]
+                if AUTODIFF: 
+                    loss.backward()
                 
-            if AUTODIFF:  
-   #             loss = self.average_loss(trainBatch, out=out, outputMask=trainOutputMaskBatch)
-                loss.backward()
-            
-                # Zero NaNs in gradients. This can sometimes pop up with BNNs.
-                total, corrupted = 0, 0
-                grad_norm = 0.0
-                for name, param in self.named_parameters():
-                    print(name)
-                    if torch.any(param.grad.isnan()):
-                        corrupted += 1
-                    param.grad = torch.nan_to_num(param.grad, 0.0)
-                    total += 1
+                    # Zero NaNs in gradients. This can sometimes pop up with BNNs.
+                    total, corrupted = 0, 0
+                    grad_norm = 0.0
+                    for name, param in self.named_parameters():
+                        print(name)
+                        if torch.any(param.grad.isnan()):
+                            corrupted += 1
+                        param.grad = torch.nan_to_num(param.grad, 0.0)
+                        total += 1
+                        
+                        grad_norm += param.grad.norm()
+                        
+                    print(f'Percentage of corrupted parameters: {100 * corrupted / total}%')
+                    print(f'Grad norm: {grad_norm}')
                     
-                    grad_norm += param.grad.norm()
-                    
-                print(f'Percentage of corrupted parameters: {100 * corrupted / total}%')
-                print(f'Grad norm: {grad_norm}')
-          
-                if self.gradientClip is not None:
-                    torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradientClip)          
-           
-                self.optimizer.step() 
-            else:
-                grad = self.params[self.active_param].compute_grad(losses)
-                print(f'Grad norm: {grad.norm()}')
-                self.params[self.active_param].weight.grad = grad
-                self.optims[self.active_param].step() 
-            
-            # Disable samplers.
-            for param in self.params:
-                param.set_active(False)
+                    self.corrupted = self.__dict__.get("corrupted", 0)
+                                            
+                    if corrupted > 0:
+                        self.corrupted += 1
+                        
+                    self.nin = self.__dict__.get("nin", 0) + 1
+                    print("CORRUPTED PERCENT: ", self.corrupted / self.nin)
+              
+                    if self.gradientClip is not None:
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradientClip)          
+               
+                    self.optimizer.step() 
+                else:
+                    grad = self.params[self.active_param].compute_grad(losses)
+                    print(f'Grad norm: {grad.norm()}')
+                    self.params[self.active_param].weight.grad = grad
+                    self.optims[self.active_param].step() 
                 
-            self.active_param = (self.active_param + 1) % len(self.params)
+                # Disable samplers.
+                for param in self.params:
+                    param.set_active(False)
+                    
+                self.active_param = (self.active_param + 1) % len(self.params)
 
             # Note: even though this is called every batch, only runs validation batch every monitor_freq batches
             self._monitor(trainBatch, validBatch=validBatch, out=out, loss=loss, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask) 
