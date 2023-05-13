@@ -391,6 +391,7 @@ class VanillaBNN(StatefulBase):
         spk_out = spk_out.to(batch[1].device)
 
         # Simulate population of neurons over time.
+        print(torch.cuda.memory_allocated())
         USE_AUTODIFF = False
         with torch.set_grad_enabled(USE_AUTODIFF):
             zin = self.W_inp(batch[0])
@@ -438,12 +439,19 @@ class VanillaBNN(StatefulBase):
             
         
         self.counter = self.__dict__.get("counter", -1) + 1
-        if self.counter % 10 == 0:
+        if self.counter % 5 == 0:
+            if self.hist is not None:
+                plot_accuracy(self.hist)
+                plt.show() 
+            
             check1 = len(self.hist['iters_monitor']) == len(self.hist['valid_loss'])
             check2 = len(self.hist['iters_monitor']) == len(self.hist['train_loss'])
             if self.hist is not None and len(self.hist['train_loss']) > 0 and check1 and check2:
                 plot_accuracy(self.hist)
                 plt.show()        
+                
+        if self.counter % 20 == 0:
+            self.autosave()
 
         # Return mean of output window
         return torch.mean(spk_out, 1)
@@ -474,7 +482,9 @@ class VanillaBNN(StatefulBase):
                 self.optims[1].zero_grad()
                 out = self.evaluate(trainBatch)
                 losses = loss_fn(out, target[:, 0, 0]) # Shape [B, 3]
+                self.hist['valid_acc'].append(self.accuracy(trainBatch, out=out, outputMask=trainOutputMask).item())
                 loss = torch.mean(losses)
+                self.hist['valid_loss'].append(loss.item())
                 loss.backward()
                 self.optims[1].step()
                 
@@ -482,6 +492,24 @@ class VanillaBNN(StatefulBase):
                 trainOutputMaskBatch = trainOutputMask[b:b+batchSize,:,:] 
             else:
                 trainOutputMaskBatch = None
+                
+                            
+            # Note: even though this is called every batch, only runs validation batch every monitor_freq batches
+            # self.monitorFreq = 1
+            # if self.hist['iter']%self.monitorFreq == 0:
+                # print(1, torch.cuda.memory_allocated())
+                # valid_out = self.evaluate(validBatch)
+                # validInp, validTarget = validBatch
+                # print(2, torch.cuda.memory_allocated())
+                # valid_loss = torch.mean(loss_fn(valid_out, validTarget[:, 0, 0]))
+                # valid_acc = self.accuracy(validBatch, out=valid_out, outputMask=validOutputMask)
+                # print(3, torch.cuda.memory_allocated())
+                # self.hist['valid_loss'].append(valid_loss.item())                
+                # self.hist['valid_acc'].append(valid_acc.item())
+                # self.scheduler.step(valid_loss) # Scheduler will decrease LR if we hit a plateau
+                # print(4, torch.cuda.memory_allocated())
+            # self._monitor(trainBatch, validBatch=validBatch, out=out, loss=loss, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask) 
+       
           
 
             # Smooth grad step.
@@ -551,11 +579,7 @@ class VanillaBNN(StatefulBase):
                     param.set_active(False)
                     
                 self.active_param = (self.active_param + 1) % len(self.params)
-
-            # Note: even though this is called every batch, only runs validation batch every monitor_freq batches
-            self._monitor(trainBatch, validBatch=validBatch, out=out, loss=loss, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask) 
-            # self._monitor(trainBatch, validBatch=validBatch, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask)  
-       
+                
             # if earlyStopValid and len(self.hist['valid_loss'])>1 and self.hist['valid_loss'][-1] > self.hist['valid_loss'][-2]:
             STEPS_BACK = 10
             # Stop if the avg_valid_loss has asymptoted (or starts to increase)

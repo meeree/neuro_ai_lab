@@ -550,7 +550,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     toy_params['n_classes'] = 3
     net_params['n_outputs'] = toy_params['n_classes']
     # net_params['loss_fn'] = 'mse'
-    train_params['lr'] = 5e-3
+    train_params['lr'] = 5e-4   
     train_params['batch_size'] = 50
     train_params['scheduler'] = 'reducePlateau'
     net_params['softmax'] = False
@@ -567,7 +567,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
     net = VanillaBNN(net_params, device='cuda').to('cuda')
     
     for param in net.params:
-        param.set_params(100, 1.0)
+        param.set_params(300, 1.0)
     
     
     for W in[net.W_ro, net.W_rec, net.W_inp]:
@@ -617,7 +617,7 @@ def analyze_network_discrete(folder = '', train = False, specific_epoch = -1):
             train_params['valid_set_size'], toy_params, net_params['n_outputs'], 
             verbose=False, auto_balance=False, device=device)
             
-        net = fit(net, 'song_all_lr5e-3_std1_S100', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=True) 
+        net = fit(net, 'song_all_lr5e-4_std1_S300', toy_params, net_params, train_params, trainData, validData, trainOutputMask, validOutputMask, override_data=True) 
         #'TEST_50ev_NO_RANDOM_5e-4_CORRECT_LR'
     # Swap out LIF model instead of HH.
     # net.use_snn = True

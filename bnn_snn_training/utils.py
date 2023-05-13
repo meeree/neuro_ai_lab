@@ -52,6 +52,16 @@ def fit(net, folder_name, toy_params, net_params, train_params, trainData, valid
     return net
 
 def plot_accuracy(hist):
+    plt.figure(figsize=(8,3))
+    plt.subplot(121)
+    plt.plot(hist['valid_loss'], color=c_vals[1], label='Test')
+    plt.subplot(122)
+    plt.plot(hist['valid_acc'], color=c_vals[1], label='Test')
+    plt.show()
+    return
+    
+    
+    
     plt.figure(figsize = (8, 3))
     plt.subplot(1,2,1)
     ax1 = plt.gca()
